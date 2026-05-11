@@ -1,0 +1,56 @@
+# Operator-facing example. Run only the service for the host you're on:
+#
+#   On the follower host (RealSense + follower arm):
+#     ADAMO_API_KEY=ak_... docker compose up follower
+#
+#   On the leader host (leader arm):
+#     ADAMO_API_KEY=ak_... docker compose up leader
+#
+# Defaults match the README:
+#   leader arm   = 192.168.1.2
+#   follower arm = 192.168.1.3
+# Override via env (ADAMO_TROSSEN_LEADER_IP / ADAMO_TROSSEN_FOLLOWER_IP) or
+# by appending more flags to the service's `command`.
+
+services:
+  leader:
+    image: ghcr.io/lukeschmitt-tr/trossen-leader:latest
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      ADAMO_API_KEY:               ${ADAMO_API_KEY:?set ADAMO_API_KEY in env or .env}
+      ADAMO_ROBOT_NAME:            ${ADAMO_ROBOT_NAME:-wxai}
+      ADAMO_TROSSEN_LEADER_IP:     ${ADAMO_TROSSEN_LEADER_IP:-192.168.1.2}
+      ADAMO_TROSSEN_FOLLOWER_IP:   ${ADAMO_TROSSEN_FOLLOWER_IP:-192.168.1.3}
+    command:
+      - --teleoperation-time=86400
+      - --rate-hz=100
+      - --velocity-limit=3.0
+      - --clear-error
+      - --protocol=quic
+
+  follower:
+    image: ghcr.io/lukeschmitt-tr/trossen-follower:latest
+    network_mode: host
+    restart: unless-stopped
+    # `privileged: true` is the simplest way to get RealSense USB access. To
+    # tighten: drop privileged, install the librealsense udev rules on the
+    # host, and rely solely on the `devices:` mount + the matching group.
+    privileged: true
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
+    environment:
+      ADAMO_API_KEY:               ${ADAMO_API_KEY:?set ADAMO_API_KEY in env or .env}
+      ADAMO_ROBOT_NAME:            ${ADAMO_ROBOT_NAME:-wxai}
+      ADAMO_TROSSEN_LEADER_IP:     ${ADAMO_TROSSEN_LEADER_IP:-192.168.1.2}
+      ADAMO_TROSSEN_FOLLOWER_IP:   ${ADAMO_TROSSEN_FOLLOWER_IP:-192.168.1.3}
+    command:
+      - --teleoperation-time=86400
+      - --rate-hz=100
+      - --clear-error
+      - --protocol=quic
+      - --camera-track=main
+      - --camera-width=640
+      - --camera-height=480
+      - --camera-fps=30
+      - --camera-bitrate-kbps=4000

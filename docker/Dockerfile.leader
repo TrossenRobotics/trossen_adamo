@@ -1,0 +1,98 @@
+# syntax=docker/dockerfile:1.7
+#
+# trossen-leader: leader-side teleop bridge over the Adamo C SDK.
+#
+# Build (from repo root):
+#   docker build -f docker/Dockerfile.leader -t trossen-leader:dev .
+#
+# Multi-arch (linux/amd64 + linux/arm64) with buildx:
+#   docker buildx build --platform linux/amd64,linux/arm64 \
+#       -f docker/Dockerfile.leader -t ghcr.io/<org>/trossen-leader:v0.1.21 \
+#       --push .
+
+ARG UBUNTU_VERSION=22.04
+ARG ADAMO_SDK_VERSION=0.1.21
+ARG TROSSEN_ARM_GIT_TAG=main
+
+# -----------------------------------------------------------------------------
+# Stage 1: builder — toolchain + SDK + compile.
+# -----------------------------------------------------------------------------
+FROM ubuntu:${UBUNTU_VERSION} AS builder
+ARG ADAMO_SDK_VERSION
+ARG TROSSEN_ARM_GIT_TAG
+ARG TARGETARCH
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cmake \
+        curl \
+        git \
+        ninja-build \
+        pkg-config \
+        libglib2.0-0 \
+        libgstreamer1.0-0 \
+        libgstreamer-plugins-base1.0-0 \
+        libva2 \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt
+RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" \
+ && case "${ARCH}" in \
+        amd64) SDK_ARCH=x86_64 ;; \
+        arm64) SDK_ARCH=arm64  ;; \
+        *) echo "Unsupported arch: ${ARCH}" >&2; exit 1 ;; \
+    esac \
+ && STEM="adamo-sdk-linux-${SDK_ARCH}-video-${ADAMO_SDK_VERSION}" \
+ && BASE="https://install.adamohq.com/sdk/v${ADAMO_SDK_VERSION}" \
+ && curl -fSL -o sdk.tar.gz        "${BASE}/${STEM}.tar.gz" \
+ && curl -fSL -o sdk.tar.gz.sha256 "${BASE}/${STEM}.tar.gz.sha256" \
+ && EXPECTED=$(awk '{print $1}' sdk.tar.gz.sha256) \
+ && ACTUAL=$(sha256sum sdk.tar.gz | awk '{print $1}') \
+ && [ "${EXPECTED}" = "${ACTUAL}" ] || { echo "SDK checksum mismatch: ${EXPECTED} vs ${ACTUAL}" >&2; exit 1; } \
+ && tar xzf sdk.tar.gz \
+ && mv "${STEM}" adamo-sdk \
+ && rm sdk.tar.gz sdk.tar.gz.sha256
+
+WORKDIR /src
+COPY . .
+RUN cmake -S . -B build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_PREFIX_PATH=/opt/adamo-sdk \
+        -DADAMO_TROSSEN_BUILD_FOLLOWER=OFF \
+        -DTROSSEN_ARM_GIT_TAG="${TROSSEN_ARM_GIT_TAG}" \
+        -DCMAKE_INSTALL_PREFIX=/opt/install \
+ && cmake --build build --parallel \
+ && cmake --install build
+
+# -----------------------------------------------------------------------------
+# Stage 2: runtime — slim image with just the binary + its runtime libs.
+# -----------------------------------------------------------------------------
+FROM ubuntu:${UBUNTU_VERSION} AS runtime
+
+LABEL org.opencontainers.image.title="trossen-leader" \
+      org.opencontainers.image.description="Adamo integration for Trossen leader-side teleop" \
+      org.opencontainers.image.source="https://github.com/lukeschmitt-tr/trossen_adamo" \
+      org.opencontainers.image.vendor="Adamo" \
+      org.opencontainers.image.licenses="MIT"
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libglib2.0-0 \
+        libgstreamer1.0-0 \
+        libgstreamer-plugins-base1.0-0 \
+        libva2 \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd --system trossen \
+ && useradd --system --gid trossen --no-create-home --shell /usr/sbin/nologin trossen
+
+COPY --from=builder /opt/adamo-sdk/lib/libadamo.so   /usr/local/lib/
+COPY --from=builder /opt/install/bin/trossen_leader  /usr/local/bin/
+RUN ldconfig
+
+USER trossen
+ENTRYPOINT ["/usr/local/bin/trossen_leader"]

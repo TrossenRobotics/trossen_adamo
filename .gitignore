@@ -1,0 +1,26 @@
+# Build output
+build/
+build-*/
+dist/
+install/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+cmake_install.cmake
+Makefile
+compile_commands.json
+*.cmake.in
+!cmake/*.cmake
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local overrides
+local/
+*.log
+*.tmp

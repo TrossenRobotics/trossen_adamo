@@ -1,0 +1,156 @@
+# syntax=docker/dockerfile:1.7
+#
+# trossen-follower: follower-side teleop bridge + RealSense → Adamo video track.
+#
+# Build (from repo root):
+#   docker build -f docker/Dockerfile.follower -t trossen-follower:dev .
+#
+# Multi-arch (linux/amd64 + linux/arm64) with buildx:
+#   docker buildx build --platform linux/amd64,linux/arm64 \
+#       -f docker/Dockerfile.follower -t ghcr.io/<org>/trossen-follower:v0.1.21 \
+#       --push .
+#
+# librealsense2 is built from source (Intel's apt repo only ships amd64
+# packages; building once gives us the same image on amd64 and arm64).
+
+ARG UBUNTU_VERSION=22.04
+ARG ADAMO_SDK_VERSION=0.1.21
+ARG TROSSEN_ARM_GIT_TAG=main
+ARG LIBREALSENSE_GIT_TAG=v2.55.1
+
+# -----------------------------------------------------------------------------
+# Stage 1: realsense — build librealsense2 from source.
+# -----------------------------------------------------------------------------
+FROM ubuntu:${UBUNTU_VERSION} AS realsense
+ARG LIBREALSENSE_GIT_TAG
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cmake \
+        git \
+        libssl-dev \
+        libudev-dev \
+        libusb-1.0-0-dev \
+        ninja-build \
+        pkg-config \
+        python3 \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+RUN git clone --depth 1 --branch "${LIBREALSENSE_GIT_TAG}" \
+        https://github.com/IntelRealSense/librealsense.git
+
+RUN cmake -S librealsense -B librealsense/build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/opt/realsense \
+        -DBUILD_EXAMPLES=OFF \
+        -DBUILD_GRAPHICAL_EXAMPLES=OFF \
+        -DBUILD_PYTHON_BINDINGS=OFF \
+        -DBUILD_UNIT_TESTS=OFF \
+        -DBUILD_WITH_TM2=OFF \
+ && cmake --build librealsense/build --parallel 2 \
+ && cmake --install librealsense/build
+# `-j 2` (not unlimited) avoids OOM on Docker Desktop's default ~8 GB cap;
+# d400-device.cpp et al. each peak at ~1.5–2 GB during -O3 codegen.
+
+# -----------------------------------------------------------------------------
+# Stage 2: builder — Adamo SDK + trossen_follower compile.
+# -----------------------------------------------------------------------------
+FROM ubuntu:${UBUNTU_VERSION} AS builder
+ARG ADAMO_SDK_VERSION
+ARG TROSSEN_ARM_GIT_TAG
+ARG TARGETARCH
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cmake \
+        curl \
+        git \
+        ninja-build \
+        pkg-config \
+        libglib2.0-0 \
+        libgstreamer1.0-0 \
+        libgstreamer-plugins-base1.0-0 \
+        libudev1 \
+        libusb-1.0-0 \
+        libva2 \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=realsense /opt/realsense /opt/realsense
+
+WORKDIR /opt
+RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" \
+ && case "${ARCH}" in \
+        amd64) SDK_ARCH=x86_64 ;; \
+        arm64) SDK_ARCH=arm64  ;; \
+        *) echo "Unsupported arch: ${ARCH}" >&2; exit 1 ;; \
+    esac \
+ && STEM="adamo-sdk-linux-${SDK_ARCH}-video-${ADAMO_SDK_VERSION}" \
+ && BASE="https://install.adamohq.com/sdk/v${ADAMO_SDK_VERSION}" \
+ && curl -fSL -o sdk.tar.gz        "${BASE}/${STEM}.tar.gz" \
+ && curl -fSL -o sdk.tar.gz.sha256 "${BASE}/${STEM}.tar.gz.sha256" \
+ && EXPECTED=$(awk '{print $1}' sdk.tar.gz.sha256) \
+ && ACTUAL=$(sha256sum sdk.tar.gz | awk '{print $1}') \
+ && [ "${EXPECTED}" = "${ACTUAL}" ] || { echo "SDK checksum mismatch: ${EXPECTED} vs ${ACTUAL}" >&2; exit 1; } \
+ && tar xzf sdk.tar.gz \
+ && mv "${STEM}" adamo-sdk \
+ && rm sdk.tar.gz sdk.tar.gz.sha256
+
+WORKDIR /src
+COPY . .
+RUN cmake -S . -B build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_PREFIX_PATH="/opt/adamo-sdk;/opt/realsense" \
+        -DADAMO_TROSSEN_BUILD_LEADER=OFF \
+        -DTROSSEN_ARM_GIT_TAG="${TROSSEN_ARM_GIT_TAG}" \
+        -DCMAKE_INSTALL_PREFIX=/opt/install \
+ && cmake --build build --parallel \
+ && cmake --install build
+
+# -----------------------------------------------------------------------------
+# Stage 3: runtime — slim image.
+# -----------------------------------------------------------------------------
+FROM ubuntu:${UBUNTU_VERSION} AS runtime
+
+LABEL org.opencontainers.image.title="trossen-follower" \
+      org.opencontainers.image.description="Adamo integration for Trossen follower-side teleop + RealSense video" \
+      org.opencontainers.image.source="https://github.com/lukeschmitt-tr/trossen_adamo" \
+      org.opencontainers.image.vendor="Adamo" \
+      org.opencontainers.image.licenses="MIT"
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libglib2.0-0 \
+        libgstreamer1.0-0 \
+        libgstreamer-plugins-base1.0-0 \
+        libudev1 \
+        libusb-1.0-0 \
+        libva2 \
+        # Baseline runtime libs the SDK loads at startup. Jetson/L4T hosts
+        # need these to be present so NVIDIA Container Toolkit can layer
+        # its L4T-specific .so's on top via the standard CSV mount path.
+        kmod \
+        libegl1 \
+        libgles2 \
+        libv4l-0 \
+        libgudev-1.0-0 \
+        libdrm2 \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd --system trossen \
+ && useradd --system --gid trossen --no-create-home --shell /usr/sbin/nologin trossen
+
+COPY --from=builder   /opt/adamo-sdk/lib/libadamo.so       /usr/local/lib/
+COPY --from=realsense /opt/realsense/lib/librealsense2.so* /usr/local/lib/
+COPY --from=builder   /opt/install/bin/trossen_follower    /usr/local/bin/
+RUN ldconfig
+
+USER trossen
+ENTRYPOINT ["/usr/local/bin/trossen_follower"]
