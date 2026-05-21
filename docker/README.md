@@ -37,7 +37,7 @@ Build args (all optional, sensible defaults baked in):
 
 | Arg                     | Default   | Notes                                        |
 | ----------------------- | --------- | -------------------------------------------- |
-| `ADAMO_SDK_VERSION`     | `0.1.21`  | Pulled from `install.adamohq.com/sdk/v<X>/`. |
+| `ADAMO_SDK_VERSION`     | `0.1.34`  | Pulled from `install.adamohq.com/sdk/v<X>/`. |
 | `TROSSEN_ARM_GIT_TAG`   | `main`    | Upstream `TrossenRobotics/trossen_arm` ref.  |
 | `LIBREALSENSE_GIT_TAG`  | `v2.55.1` | follower only.                               |
 | `UBUNTU_VERSION`        | `22.04`   | Base image tag.                              |
@@ -47,7 +47,7 @@ Multi-arch via buildx:
 ```sh
 docker buildx build --platform linux/amd64,linux/arm64 \
     -f docker/Dockerfile.leader \
-    -t ghcr.io/lukeschmitt-tr/trossen-leader:v0.1.21 --push .
+    -t ghcr.io/lukeschmitt-tr/trossen-leader:v0.1.34 --push .
 ```
 
 The follower's `librealsense2` build adds ~5–10 min on first run; subsequent

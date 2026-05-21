@@ -7,11 +7,11 @@
 #
 # Multi-arch (linux/amd64 + linux/arm64) with buildx:
 #   docker buildx build --platform linux/amd64,linux/arm64 \
-#       -f docker/Dockerfile.leader -t ghcr.io/<org>/trossen-leader:v0.1.21 \
+#       -f docker/Dockerfile.leader -t ghcr.io/<org>/trossen-leader:v0.1.34 \
 #       --push .
 
 ARG UBUNTU_VERSION=22.04
-ARG ADAMO_SDK_VERSION=0.1.21
+ARG ADAMO_SDK_VERSION=0.1.34
 ARG TROSSEN_ARM_GIT_TAG=main
 
 # -----------------------------------------------------------------------------

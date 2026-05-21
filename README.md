@@ -45,7 +45,7 @@ Binaries land at `build/{leader,follower}/trossen_{leader,follower}`.
 Useful flags:
 
 - `-DADAMO_TROSSEN_BUILD_FOLLOWER=OFF` / `-DADAMO_TROSSEN_BUILD_LEADER=OFF` — skip one binary.
-- `-DCMAKE_PREFIX_PATH=/abs/path/extracted-sdk` — point CMake at an Adamo SDK install (tarballs at <https://install.adamohq.com/sdk/v0.1.21/>).
+- `-DCMAKE_PREFIX_PATH=/abs/path/extracted-sdk` — point CMake at an Adamo SDK install (tarballs at <https://install.adamohq.com/sdk/v0.1.34/>).
 - `-DTROSSEN_ARM_GIT_TAG=<ref>` — pin the upstream `libtrossen_arm` ref (default `v1.10.0`).
 - `-Drealsense2_DIR=/abs/path/lib/cmake/realsense2` — for non-system librealsense.
 
