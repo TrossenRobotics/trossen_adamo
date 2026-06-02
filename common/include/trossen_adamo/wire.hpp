@@ -17,12 +17,22 @@
 #include <stdexcept>
 #include <vector>
 
+#include "trossen_vr/vr_types.hpp"
+
 namespace trossen_adamo::wire {
 
 inline constexpr int kNumJoints = 7;
 inline constexpr std::size_t kStateBytes  = (1 + kNumJoints * 2) * sizeof(double);
 inline constexpr std::size_t kEffortBytes = (1 + kNumJoints) * sizeof(double);
 inline constexpr std::size_t kReadyBytes  = sizeof(double);
+
+inline constexpr std::size_t kVrFrameBytes =
+    sizeof(double) +                  // Timestamp (8 bytes)
+    sizeof(uint8_t) +                 // Tracking Status Flag bitmask (1 byte)
+    (3 + 4) * sizeof(double) +        // Right Hand: 3 Position, 4 Quaternion (56 bytes)
+    (3 + 4) * sizeof(double) +        // Left Hand: 3 Position, 4 Quaternion (56 bytes)
+    4 * sizeof(double) +              // Teleop Triggers/Grips: R_Trigger, L_Trigger, R_Grip, L_Grip (32 bytes)
+    sizeof(uint8_t);                  // Digital Buttons Bitmask: A, B, X, Y (1 byte)
 
 inline std::uint64_t bswap64(std::uint64_t v) noexcept {
 #if defined(__GNUC__) || defined(__clang__)
@@ -81,6 +91,124 @@ encode_state(double timestamp,
     for (double v : positions)  { pack_be_double(v, p); p += sizeof(double); }
     for (double v : velocities) { pack_be_double(v, p); p += sizeof(double); }
     return out;
+}
+
+inline std::array<std::uint8_t, kVrFrameBytes> 
+encode_vr_frame(double timestamp, const trossen_vr::VRFrame& frame) {
+    std::array<std::uint8_t, kVrFrameBytes> out{};
+    std::uint8_t* p = out.data();
+
+    pack_be_double(timestamp, p);
+    p += sizeof(double);
+
+    // Pack Tracking Status Bitmask
+    std::uint8_t tracking_mask = 0;
+    if (frame.right.has_value()) tracking_mask |= 0x01;
+    if (frame.left.has_value())  tracking_mask |= 0x02;
+    *p = tracking_mask;
+    p += sizeof(std::uint8_t);
+
+    // Pack Right Hand Pose
+    trossen_vr::ControllerPose r_pose = frame.right.value_or(trossen_vr::ControllerPose{});
+    pack_be_double(r_pose.position.x(), p); p += sizeof(double);
+    pack_be_double(r_pose.position.y(), p); p += sizeof(double);
+    pack_be_double(r_pose.position.z(), p); p += sizeof(double);
+    pack_be_double(r_pose.rotation.w(), p); p += sizeof(double);
+    pack_be_double(r_pose.rotation.x(), p); p += sizeof(double);
+    pack_be_double(r_pose.rotation.y(), p); p += sizeof(double);
+    pack_be_double(r_pose.rotation.z(), p); p += sizeof(double);
+
+    // Pack Left Hand Pose
+    trossen_vr::ControllerPose l_pose = frame.left.value_or(trossen_vr::ControllerPose{});
+    pack_be_double(l_pose.position.x(), p); p += sizeof(double);
+    pack_be_double(l_pose.position.y(), p); p += sizeof(double);
+    pack_be_double(l_pose.position.z(), p); p += sizeof(double);
+    pack_be_double(l_pose.rotation.w(), p); p += sizeof(double);
+    pack_be_double(l_pose.rotation.x(), p); p += sizeof(double);
+    pack_be_double(l_pose.rotation.y(), p); p += sizeof(double);
+    pack_be_double(l_pose.rotation.z(), p); p += sizeof(double);
+
+    // Pack Button Outputs (Analog or grip output)
+    pack_be_double(frame.get_analog(trossen_vr::ButtonNames::RightTrigger), p); p += sizeof(double);
+    pack_be_double(frame.get_analog(trossen_vr::ButtonNames::LeftTrigger),  p); p += sizeof(double);
+    pack_be_double(frame.get_analog(trossen_vr::ButtonNames::RightGrip),    p); p += sizeof(double);
+    pack_be_double(frame.get_analog(trossen_vr::ButtonNames::LeftGrip),     p); p += sizeof(double);
+
+    // Pack Buttons Outputs (Digital or push button output)
+    std::uint8_t button_mask = 0;
+    if (frame.get_button(trossen_vr::ButtonNames::A)) button_mask |= 0x01;
+    if (frame.get_button(trossen_vr::ButtonNames::B)) button_mask |= 0x02;
+    if (frame.get_button(trossen_vr::ButtonNames::X)) button_mask |= 0x04;
+    if (frame.get_button(trossen_vr::ButtonNames::Y)) button_mask |= 0x08;
+    *p = button_mask;
+
+    return out;
+}
+
+inline trossen_vr::VRFrame 
+decode_vr_frame(const std::uint8_t* data, std::size_t len, double* out_timestamp = nullptr) {
+    if (len != kVrFrameBytes) {
+        throw std::runtime_error("decode_vr_frame: Binary telemetry packet corrupted! Expected " + 
+                                 std::to_string(kVrFrameBytes) + " bytes, but received: " + std::to_string(len));
+    }
+
+    trossen_vr::VRFrame frame;
+    const std::uint8_t* p = data;
+
+    // Unpack Timestamp
+    double ts = unpack_be_double(p);
+    if (out_timestamp) {
+        *out_timestamp = ts;
+    }
+    p += sizeof(double);
+
+    // Unpack Tracking Status Bitmask (Bit 0 = Right, Bit 1 = Left)
+    std::uint8_t tracking_mask = *p;
+    p += sizeof(std::uint8_t);
+
+    // Unpack Right Controller Pose
+    trossen_vr::ControllerPose r_pose;
+    r_pose.position.x() = unpack_be_double(p); p += sizeof(double);
+    r_pose.position.y() = unpack_be_double(p); p += sizeof(double);
+    r_pose.position.z() = unpack_be_double(p); p += sizeof(double);
+    r_pose.rotation.w() = unpack_be_double(p); p += sizeof(double);
+    r_pose.rotation.x() = unpack_be_double(p); p += sizeof(double);
+    r_pose.rotation.y() = unpack_be_double(p); p += sizeof(double);
+    r_pose.rotation.z() = unpack_be_double(p); p += sizeof(double);
+    
+    // Only populate the optional if the status mask confirms tracking was alive during transmit
+    if (tracking_mask & 0x01) {
+        frame.right = r_pose;
+    }
+
+    // Unpack Left Controller Pose
+    trossen_vr::ControllerPose l_pose;
+    l_pose.position.x() = unpack_be_double(p); p += sizeof(double);
+    l_pose.position.y() = unpack_be_double(p); p += sizeof(double);
+    l_pose.position.z() = unpack_be_double(p); p += sizeof(double);
+    l_pose.rotation.w() = unpack_be_double(p); p += sizeof(double);
+    l_pose.rotation.x() = unpack_be_double(p); p += sizeof(double);
+    l_pose.rotation.y() = unpack_be_double(p); p += sizeof(double);
+    l_pose.rotation.z() = unpack_be_double(p); p += sizeof(double);
+    
+    if (tracking_mask & 0x02) {
+        frame.left = l_pose;
+    }
+
+    // Unpack Button Outputs (Analog or grip output)
+    frame.buttons[trossen_vr::ButtonNames::RightTrigger] = trossen_vr::ButtonValue(unpack_be_double(p)); p += sizeof(double);
+    frame.buttons[trossen_vr::ButtonNames::LeftTrigger]  = trossen_vr::ButtonValue(unpack_be_double(p)); p += sizeof(double);
+    frame.buttons[trossen_vr::ButtonNames::RightGrip]    = trossen_vr::ButtonValue(unpack_be_double(p)); p += sizeof(double);
+    frame.buttons[trossen_vr::ButtonNames::LeftGrip]     = trossen_vr::ButtonValue(unpack_be_double(p)); p += sizeof(double);
+
+    // Unpack Buttons Outputs (Digital or push button output)
+    std::uint8_t button_mask = *p;
+    frame.buttons[trossen_vr::ButtonNames::A] = trossen_vr::ButtonValue(static_cast<bool>(button_mask & 0x01));
+    frame.buttons[trossen_vr::ButtonNames::B] = trossen_vr::ButtonValue(static_cast<bool>(button_mask & 0x02));
+    frame.buttons[trossen_vr::ButtonNames::X] = trossen_vr::ButtonValue(static_cast<bool>(button_mask & 0x04));
+    frame.buttons[trossen_vr::ButtonNames::Y] = trossen_vr::ButtonValue(static_cast<bool>(button_mask & 0x08));
+
+    return frame;
 }
 
 struct State {
