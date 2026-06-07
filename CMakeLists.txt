@@ -18,6 +18,8 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake")
 
 option(ADAMO_TROSSEN_BUILD_LEADER   "Build the trossen_leader binary"   ON)
 option(ADAMO_TROSSEN_BUILD_FOLLOWER "Build the trossen_follower binary" ON)
+option(ADAMO_TROSSEN_BUILD_VR_HEADSET "Build the vr_headset binary" ON)
+option(ADAMO_TROSSEN_BUILD_VR_FOLLOWER "Build the vr_follower binary" ON)
 
 # ---------------------------------------------------------------------------
 # Adamo C SDK — resolved via find_package(Adamo CONFIG).
@@ -34,6 +36,9 @@ option(ADAMO_TROSSEN_BUILD_FOLLOWER "Build the trossen_follower binary" ON)
 set(Adamo_VIDEO ON CACHE BOOL "Enable the Adamo video bindings (required by trossen_follower)")
 
 find_package(Adamo CONFIG REQUIRED)
+find_package(Threads REQUIRED)
+find_package(nlohmann_json REQUIRED)
+find_package(trossen_vr CONFIG REQUIRED)
 
 if(NOT TARGET Adamo::adamo_cpp)
     message(FATAL_ERROR
@@ -56,6 +61,7 @@ target_compile_features(trossen_adamo_common INTERFACE cxx_std_17)
 target_link_libraries(trossen_adamo_common INTERFACE
     Adamo::adamo_cpp
     TrossenArm::TrossenArm
+    trossen_vr::trossen_vr_lib
 )
 if(UNIX)
     target_link_libraries(trossen_adamo_common INTERFACE pthread)
@@ -70,6 +76,16 @@ endif()
 if(ADAMO_TROSSEN_BUILD_FOLLOWER)
     add_subdirectory(follower)
 endif()
+if(ADAMO_TROSSEN_BUILD_VR_HEADSET)
+    add_subdirectory(vr_headset)
+endif()
+if(ADAMO_TROSSEN_BUILD_VR_FOLLOWER)
+    add_subdirectory(vr_follower)
+endif()
+option(ADAMO_TROSSEN_BUILD_VR_BIMANUAL "Build VR bimanual binary" OFF)
+if(ADAMO_TROSSEN_BUILD_VR_BIMANUAL)
+    add_subdirectory(vr_bimanual)
+endif()
 
 # libadamo ships with install_name @rpath/libadamo.dylib (macOS) and
 # DT_SONAME libadamo.so (Linux). Both need the loader to find the file via
@@ -81,7 +97,7 @@ endif()
 get_target_property(_adamo_loc Adamo::adamo IMPORTED_LOCATION)
 if(_adamo_loc)
     get_filename_component(_adamo_dir "${_adamo_loc}" DIRECTORY)
-    foreach(_target trossen_leader trossen_follower)
+    foreach(_target trossen_leader trossen_follower vr_headset vr_follower vr_bimanual)
         if(TARGET ${_target})
             set_property(TARGET ${_target} APPEND PROPERTY BUILD_RPATH "${_adamo_dir}")
         endif()
