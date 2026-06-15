@@ -21,8 +21,15 @@
 
 #include <array>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstdint>
+#include <exception>
 #include <iostream>
 #include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
 
 using trossen_vr::pose6d_to_transform4d;
 using trossen_vr::transform4d_to_pose6d;
@@ -148,7 +155,7 @@ int main(int argc, char** argv) try {
     auto ready_pub = session.publisher(follower_ready_topic, 250, true, false);
     
     // Wait for vr_headset to be ready before starting teleop.
-    ta::handshake::wait_for_peer_ready(ready_pub, ready_sub, opt.ready_timeout, "leader");
+    ta::handshake::wait_for_peer_ready(ready_pub, ready_sub, opt.ready_timeout, "vr_headset");
 
     std::cout << "bimanual_follower: starting teleop\n";
     std::cout << "bimanual_follower: grip/hand trigger to engage each arm independently\n";
