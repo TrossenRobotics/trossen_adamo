@@ -14,7 +14,7 @@
 #include "trossen_adamo/publisher.hpp"
 #include "trossen_adamo/signal.hpp"
 #include "trossen_adamo/topics.hpp"
-#include "trossen_adamo/wire.hpp"
+#include "trossen_adamo/wire_vr.hpp"
 
 #include <chrono>
 #include <cstdio>
