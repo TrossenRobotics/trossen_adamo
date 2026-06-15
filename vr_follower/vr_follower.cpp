@@ -21,8 +21,15 @@
 
 #include <array>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstdint>
+#include <exception>
 #include <iostream>
 #include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
 
 using trossen_vr::pose6d_to_transform4d;
 using trossen_vr::transform4d_to_pose6d;
@@ -106,7 +113,7 @@ int main(int argc, char** argv) try {
     const double gripper_max_m = 0.04;    // Maximum gripper opening (meters).
     const double cmd_goal_time = 0.15;    // Cartesian command goal time (seconds).
 
-    std::cout << "follower: configuring arm at " << opt.follower_ip << "\n";
+    std::cout << "vr_follower: configuring arm at " << opt.follower_ip << "\n";
     auto driver = ta::arm::configure(opt.follower_ip,
                                      trossen_arm::StandardEndEffector::wxai_v0_follower,
                                      opt.clear_error,
@@ -116,7 +123,7 @@ int main(int argc, char** argv) try {
     // Declared before session so camera/network stops before arm parking.
     ta::arm::ArmParkGuard park_guard(*driver, "follower");
 
-    std::cout << "follower: opening Adamo session (" << opt.protocol_str << ")\n";
+    std::cout << "vr_follower: opening Adamo session (" << opt.protocol_str << ")\n";
     auto session = adamo::Session::open(opt.api_key, protocol);
 
     const auto state_topic            = ta::topics::vr_state_of(opt.robot);
@@ -127,16 +134,16 @@ int main(int argc, char** argv) try {
     ta::LatestSubscriber state_sub(session, state_topic);
     auto ready_sub = session.subscribe(vr_headset_ready_topic);
 
-    std::cout << "follower: moving to home\n";
+    std::cout << "vr_follower: moving to home\n";
     ta::arm::move_home(*driver);
 
     auto ready_pub = session.publisher(follower_ready_topic, 250, true, false);
     
     // Wait for vr_headset to be ready before starting teleop.
-    ta::handshake::wait_for_peer_ready(ready_pub, ready_sub, opt.ready_timeout, "leader");
+    ta::handshake::wait_for_peer_ready(ready_pub, ready_sub, opt.ready_timeout, "vr_headset");
 
-    std::cout << "follower: starting teleop\n";
-    std::cout << "follower: grip/hand trigger to engage, release to pause. Press B to exit\n";
+    std::cout << "vr_follower: starting teleop\n";
+    std::cout << "vr_follower: grip/hand trigger to engage, release to pause. Press B to exit\n";
     std::this_thread::sleep_for(std::chrono::seconds(1));
     driver->set_all_modes(trossen_arm::Mode::position);
 
@@ -216,23 +223,23 @@ int main(int argc, char** argv) try {
                 }
                     
             } catch (const std::exception& e) {
-                std::fprintf(stderr, "follower: bad state payload: %s\n", e.what());
+                std::fprintf(stderr, "vr_follower: bad state payload: %s\n", e.what());
             }
         }
 
         const auto elapsed_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - loop_start).count();
         if (elapsed_ms > opt.stall_log_ms) {
-            std::fprintf(stderr, "follower loop stall: %.1fms\n", elapsed_ms);
+            std::fprintf(stderr, "vr_follower loop stall: %.1fms\n", elapsed_ms);
         }
         ta::sleep_until_next_tick(loop_start, opt.rate_hz);
     }
 
-    std::cout << "follower: returning home + sleep\n";
+    std::cout << "vr_follower: returning home + sleep\n";
     // park_guard runs here as we return: position mode, home, sleep.
     return 0;
 
 } catch (const std::exception& e) {
-    std::fprintf(stderr, "follower error: %s\n", e.what());
+    std::fprintf(stderr, "vr_follower error: %s\n", e.what());
     return 1;
 }
