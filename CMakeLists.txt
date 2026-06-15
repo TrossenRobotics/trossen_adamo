@@ -37,8 +37,12 @@ set(Adamo_VIDEO ON CACHE BOOL "Enable the Adamo video bindings (required by tros
 
 find_package(Adamo CONFIG REQUIRED)
 find_package(Threads REQUIRED)
-find_package(nlohmann_json REQUIRED)
-find_package(trossen_vr CONFIG REQUIRED)
+
+# VR dependencies - only required when building VR binaries
+if(ADAMO_TROSSEN_BUILD_VR_HEADSET OR ADAMO_TROSSEN_BUILD_VR_FOLLOWER OR ADAMO_TROSSEN_BUILD_VR_BIMANUAL)
+    find_package(nlohmann_json REQUIRED)
+    find_package(trossen_vr CONFIG REQUIRED)
+endif()
 
 if(NOT TARGET Adamo::adamo_cpp)
     message(FATAL_ERROR
@@ -61,7 +65,6 @@ target_compile_features(trossen_adamo_common INTERFACE cxx_std_17)
 target_link_libraries(trossen_adamo_common INTERFACE
     Adamo::adamo_cpp
     TrossenArm::TrossenArm
-    trossen_vr::trossen_vr_lib
 )
 if(UNIX)
     target_link_libraries(trossen_adamo_common INTERFACE pthread)
