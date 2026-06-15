@@ -3,16 +3,21 @@
 The official [Adamo](https://adamohq.com) integration for Trossen Robotics'
 WidowX AI follower/leader teleop. Built by Adamo so Trossen hosts can deploy
 Adamo teleop, recording, and replay against `libtrossen_arm` arms out of the
-box. Two binaries built from one CMake project:
+box. Five binaries built from one CMake project:
 
 | Binary             | Talks to                                                         |
 | ------------------ | ---------------------------------------------------------------- |
 | `trossen_leader`   | leader arm via `libtrossen_arm`, Adamo pubsub                    |
 | `trossen_follower` | follower arm via `libtrossen_arm`, Adamo pubsub, RealSense video |
+| `vr_headset`       | Meta Quest VR headset via UDP (trossen_vr), Adamo pubsub         |
+| `vr_follower`      | follower arm via `libtrossen_arm`, Adamo pubsub (VR control)     |
+| `vr_bimanual`      | both follower arms via `libtrossen_arm`, Adamo pubsub (VR control) |
 
 For container builds (multi-arch Linux images), see [`docker/README.md`](docker/README.md).
 
 ## Architecture
+
+### Leader-Follower Teleop
 
 Two binaries on two hosts, talking over Adamo's pubsub bus:
 
@@ -23,10 +28,28 @@ Two binaries on two hosts, talking over Adamo's pubsub bus:
   incoming leader poses, publishes its own external efforts back, and
   (optionally) streams a RealSense color track to Adamo.
 
-On startup, both sides publish a wall-clock timestamp on their own `*_ready`
-topic and block until they see a fresh ready sample from the peer. Either
-side exiting (Ctrl-C, fault, or a timeout) drives both arms back to `home`
-then `sleep` via an RAII guard.
+### VR Teleoperation
+
+VR teleoperation enables remote control of Trossen arms using Meta Quest VR
+controllers via Adamo pubsub. Two modes are supported:
+
+**Single-arm mode** (`vr_headset` + `vr_follower`):
+- `vr_headset` receives VR controller data via UDP (port 9000) from a Unity
+  app on Meta Quest, publishes VR frames (poses + buttons + triggers) to Adamo.
+- `vr_follower` subscribes to VR frames, controls one follower arm in cartesian
+  mode. Grip/hand trigger to engage, release to pause. Button B to exit. Right
+  index trigger controls gripper.
+
+**Bimanual mode** (`vr_headset` + `vr_bimanual`):
+- `vr_headset` broadcasts controller data for both hands to Adamo.
+- `vr_bimanual` controls two follower arms simultaneously (right arm at
+  192.168.1.4, left arm at 192.168.1.5). Each controller independently controls
+  its corresponding arm. Button B (right) or Y (left) to exit.
+
+On startup, all binaries use a ready-handshake: each side publishes a
+wall-clock timestamp on its `*_ready` topic and blocks until it sees a fresh
+sample from the peer. Either side exiting (Ctrl-C, fault, timeout) drives the
+arms back to `home` then `sleep` via an RAII guard.
 
 The integration primitives — latest-only subscriber, decoupled latest-only
 publisher, ready handshake, arm-park guard, wire codec — live header-only
@@ -40,17 +63,19 @@ cmake -S . -B build
 cmake --build build --parallel
 ```
 
-Binaries land at `build/{leader,follower}/trossen_{leader,follower}`.
+Binaries land at `build/{leader,follower,vr_headset,vr_follower,vr_bimanual}/`.
 
 Useful flags:
 
-- `-DADAMO_TROSSEN_BUILD_FOLLOWER=OFF` / `-DADAMO_TROSSEN_BUILD_LEADER=OFF` — skip one binary.
+- `-DADAMO_TROSSEN_BUILD_FOLLOWER=OFF` / `-DADAMO_TROSSEN_BUILD_LEADER=OFF` — skip arm teleop binaries.
+- `-DADAMO_TROSSEN_BUILD_VR_HEADSET=OFF` / `-DADAMO_TROSSEN_BUILD_VR_FOLLOWER=OFF` / `-DADAMO_TROSSEN_BUILD_VR_BIMANUAL=OFF` — skip VR binaries.
 - `-DCMAKE_PREFIX_PATH=/abs/path/extracted-sdk` — point CMake at an Adamo SDK install (tarballs at <https://install.adamohq.com/sdk/v0.1.34/>).
 - `-DTROSSEN_ARM_GIT_TAG=<ref>` — pin the upstream `libtrossen_arm` ref (default `v1.10.0`).
 - `-Drealsense2_DIR=/abs/path/lib/cmake/realsense2` — for non-system librealsense.
 
 `librealsense2` is required only for the follower (`brew install librealsense`
-on macOS, `apt install librealsense2-dev` on Linux).
+on macOS, `apt install librealsense2-dev` on Linux). VR binaries require
+`trossen_vr` (install to `/usr/local` via `sudo make install`).
 
 ## Run
 
@@ -101,6 +126,51 @@ build/leader/trossen_leader \
 
 `Ctrl-C` on either side unwinds both cleanly (move-home → sleep). `--help` on
 either binary prints the full flag list.
+
+### VR Teleoperation
+
+**VR Headset** (receives Meta Quest controller data, publishes to Adamo):
+
+```sh
+build/vr_headset/vr_headset \
+    --teleoperation-time 86400 \
+    --rate-hz 100 \
+    --protocol quic
+```
+
+**Single-arm VR Follower** (right controller controls one arm):
+
+```sh
+build/vr_follower/vr_follower \
+    --teleoperation-time 86400 \
+    --follower-ip 192.168.1.4 \
+    --rate-hz 100 \
+    --clear-error \
+    --protocol quic
+```
+
+**Bimanual VR Follower** (both controllers control both arms):
+
+```sh
+build/vr_bimanual/vr_bimanual \
+    --teleoperation-time 86400 \
+    --right-arm-ip 192.168.1.4 \
+    --left-arm-ip 192.168.1.5 \
+    --rate-hz 100 \
+    --clear-error \
+    --protocol quic
+```
+
+**VR Controls:**
+- **Grip/hand trigger**: Engage arm (hold to control, release to pause)
+- **Index trigger**: Control gripper (0.0-1.0 → 0-40mm opening)
+- **Button B** (right) or **Y** (left): Exit teleoperation
+
+**Defaults:**
+- Robot name: `vr_teleop` (override via `--robot` or env `ADAMO_ROBOT_NAME`)
+- Single-arm follower IP: `192.168.1.3` (override via `--follower-ip` or env `ADAMO_TROSSEN_FOLLOWER_IP`)
+- Bimanual right arm IP: `192.168.1.4` (override via `--right-arm-ip` or env `ADAMO_TROSSEN_RIGHT_ARM_IP`)
+- Bimanual left arm IP: `192.168.1.5` (override via `--left-arm-ip` or env `ADAMO_TROSSEN_LEFT_ARM_IP`)
 
 ## Supported platforms
 
