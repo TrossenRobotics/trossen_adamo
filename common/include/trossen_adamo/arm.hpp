@@ -14,7 +14,7 @@
 
 namespace trossen_adamo::arm {
 
-// Home pose: 7 joints with both shoulder joints at pi/2 and the rest zero.
+// Home pose
 inline std::vector<double> home_pose() {
     return {0.0, M_PI/3, M_PI/6, M_PI/5, 0.0, 0.0, 0.0};
 }

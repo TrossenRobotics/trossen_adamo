@@ -11,7 +11,7 @@ box. Five binaries built from one CMake project:
 | `trossen_follower` | follower arm via `libtrossen_arm`, Adamo pubsub, RealSense video |
 | `vr_headset`       | Meta Quest VR headset via UDP (trossen_vr), Adamo pubsub         |
 | `vr_follower`      | follower arm via `libtrossen_arm`, Adamo pubsub (VR control)     |
-| `vr_bimanual`      | both follower arms via `libtrossen_arm`, Adamo pubsub (VR control)|
+| `vr_bimanual`      | both follower arms via `libtrossen_arm`, Adamo pubsub (VR control) |
 
 For container builds (multi-arch Linux images), see [`docker/README.md`](docker/README.md).
 
@@ -46,7 +46,7 @@ controllers via Adamo pubsub. Two modes are supported:
   192.168.1.4, left arm at 192.168.1.5). Each controller independently controls
   its corresponding arm. Button B (right) or Y (left) to exit.
 
-On startup, both teleop modes use a ready-handshake: each side publishes a
+On startup, all binaries use a ready-handshake: each side publishes a
 wall-clock timestamp on its `*_ready` topic and blocks until it sees a fresh
 sample from the peer. Either side exiting (Ctrl-C, fault, timeout) drives the
 arms back to `home` then `sleep` via an RAII guard.
