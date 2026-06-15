@@ -38,7 +38,7 @@ set(Adamo_VIDEO ON CACHE BOOL "Enable the Adamo video bindings (required by tros
 find_package(Adamo CONFIG REQUIRED)
 find_package(Threads REQUIRED)
 
-# VR dependencies - only required when building VR binaries
+# VR dependencies
 if(ADAMO_TROSSEN_BUILD_VR_HEADSET OR ADAMO_TROSSEN_BUILD_VR_FOLLOWER OR ADAMO_TROSSEN_BUILD_VR_BIMANUAL)
     find_package(nlohmann_json REQUIRED)
     find_package(trossen_vr CONFIG REQUIRED)
