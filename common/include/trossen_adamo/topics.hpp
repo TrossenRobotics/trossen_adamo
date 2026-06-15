@@ -20,5 +20,11 @@ inline std::string leader_ready_of(const std::string& robot) {
 inline std::string follower_ready_of(const std::string& robot) {
     return robot + "/trossen/reference/follower_ready";
 }
+inline std::string vr_headset_ready_of(const std::string& robot) {
+    return robot + "/trossen/reference/vr_headset_ready";
+}
+inline std::string vr_state_of(const std::string& robot) {
+    return robot + "/trossen/reference/vr_state";
+}
 
 }  // namespace trossen_adamo::topics
