@@ -16,9 +16,13 @@
 #include "trossen_adamo/topics.hpp"
 #include "trossen_adamo/wire.hpp"
 
-#include <iostream>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <iostream>
 #include <stdexcept>
+#include <string>
+#include <thread>
 
 namespace {
 
@@ -30,7 +34,6 @@ struct Options {
     std::string robot;        // resolved to kDefaultRobot if neither CLI nor env set
     std::string protocol_str = "quic";
     double teleoperation_time = 20.0;
-    double connection_timeout = 20.0;
     double ready_timeout = 60.0;
     double rate_hz = 100.0;
     double stall_log_ms = 50.0;
@@ -49,7 +52,6 @@ void usage(const char* prog) {
         "Options:\n"
         "  --protocol quic|udp|tcp     (default: quic)\n"
         "  --teleoperation-time SEC    (default: 20)\n"
-        "  --connect-timeout SEC       (default: 20)\n"
         "  --ready-timeout SEC         (default: 60)\n"
         "  --rate-hz HZ                (default: 100)\n"
         "  --stall-log-ms MS           (default: 50)\n",
@@ -65,7 +67,6 @@ Options parse(int argc, char** argv) {
         else if (a == "--robot")               o.robot = ta::require_value(a, argc, argv, i);
         else if (a == "--protocol")            o.protocol_str = ta::require_value(a, argc, argv, i);
         else if (a == "--teleoperation-time")  o.teleoperation_time = ta::parse_double(ta::require_value(a, argc, argv, i), a);
-        else if (a == "--connect-timeout")     o.connection_timeout = ta::parse_double(ta::require_value(a, argc, argv, i), a);
         else if (a == "--ready-timeout")       o.ready_timeout = ta::parse_double(ta::require_value(a, argc, argv, i), a);
         else if (a == "--rate-hz")             o.rate_hz = ta::parse_double(ta::require_value(a, argc, argv, i), a);
         else if (a == "--stall-log-ms")        o.stall_log_ms = ta::parse_double(ta::require_value(a, argc, argv, i), a);
@@ -104,7 +105,7 @@ int main(int argc, char** argv) try {
     // Follower readiness subscription (vr_follower will publish when ready).
     auto ready_sub = session.subscribe(follower_ready_topic);
 
-    // Headset publishes VR frames to state_topic and readiness heartbeat.
+    // Headset publishes VR frames to state_topic and readiness signal for handshake.
     auto ready_pub = session.publisher(vr_headset_ready_topic, /*priority=*/250,
                                        /*express=*/true, /*reliable=*/false);
     auto state_pub = session.publisher(state_topic, /*priority=*/250,
@@ -119,7 +120,6 @@ int main(int argc, char** argv) try {
     std::cout << "vr_headset: broadcasting VR controller data to vr_follower\n";
     std::this_thread::sleep_for(std::chrono::seconds(1));
 
-    const double teleop_started_at = ta::wire::now_seconds();
     const auto loop_end = std::chrono::steady_clock::now() +
                           std::chrono::duration<double>(opt.teleoperation_time);
 
@@ -155,7 +155,7 @@ int main(int argc, char** argv) try {
         auto frame_opt = receiver.latest_frame();
         
         if (!frame_opt) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            ta::sleep_until_next_tick(loop_start, opt.rate_hz);
             continue;
         }
         const auto& frame = *frame_opt;
