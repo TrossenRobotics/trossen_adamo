@@ -1,17 +1,27 @@
 find_package(realsense2 REQUIRED)
+find_package(ZED 4 REQUIRED)
+find_package(CUDA REQUIRED)
 
 add_executable(trossen_follower
     follower.cpp
 )
 
 target_include_directories(trossen_follower PRIVATE
-    "${CMAKE_CURRENT_LIST_DIR}"
+    ${ZED_INCLUDE_DIRS}
+    ${CUDA_INCLUDE_DIRS}
+)
+
+target_link_directories(trossen_follower PRIVATE
+    ${ZED_LIBRARY_DIR}
+    ${CUDA_LIBRARY_DIRS}
 )
 
 target_link_libraries(trossen_follower
     PRIVATE
         trossen_adamo_common
         realsense2::realsense2
+        ${ZED_LIBRARIES}
+        ${CUDA_LIBRARIES}
 )
 
 # When realsense2 is not installed system-wide, librealsense often lives next

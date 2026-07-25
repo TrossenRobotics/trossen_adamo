@@ -1,8 +1,8 @@
 // Trossen leader machine binary.
 //
-// Drives the leader arm in `external_effort` mode, publishes joint state at
-// `--rate-hz`, and applies force feedback from follower efforts. Mirrors the
-// flow of Trossen's reference `demos/python/teleoperation.py`.
+// Drives the Glide arm or leader arm in external_effort mode, applies force feedback,
+// for glide corrects joint-frame conventions for joints 3/4/5, and publishes
+// positions at --rate-hz.
 
 #include "adamo/adamo.hpp"
 #include "libtrossen_arm/trossen_arm.hpp"
@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -30,6 +31,12 @@ namespace {
 // Built-in defaults. Override order: CLI flag > environment variable > default.
 constexpr const char* kDefaultRobot     = "wxai";
 constexpr const char* kDefaultLeaderIp  = "192.168.1.2";
+
+// Gripper force-feedback constants.
+constexpr double LEADER_GRIPPER_MAX_EFFORT   = 27.0;
+constexpr double FOLLOWER_GRIPPER_MAX_EFFORT = 87.5;
+constexpr double GRIPPER_EFFORT_OFFSET       = 8.0;
+constexpr double kDefaultJoint5Offset        = M_PI / 4.0;
 
 struct Options {
     std::string api_key;
@@ -44,7 +51,19 @@ struct Options {
     double velocity_limit = 5.0;
     double stall_log_ms = 50.0;
     bool clear_error = false;
+    std::string model_str = "glide_right";
 };
+
+trossen_arm::Model parse_model(const std::string& s) {
+    if (s == "glide_right") return trossen_arm::Model::glide_right;
+    if (s == "glide_left")  return trossen_arm::Model::glide_left;
+    if (s == "wxai_v0")     return trossen_arm::Model::wxai_v0;
+    throw std::runtime_error("invalid --model: " + s + " (expected glide_right|glide_left|wxai_v0)");
+}
+
+bool is_glide(const std::string& model_str) {
+    return model_str == "glide_right" || model_str == "glide_left";
+}
 
 void usage(const char* prog) {
     std::fprintf(stderr,
@@ -66,7 +85,8 @@ void usage(const char* prog) {
         "  --connect-timeout SEC       (default: 20)\n"
         "  --ready-timeout SEC         (default: 60)\n"
         "  --stall-log-ms MS           (default: 50)\n"
-        "  --clear-error               clear arm fault on connect\n",
+        "  --clear-error               clear arm fault on connect\n"
+        "  --model NAME                glide_right|glide_left|wxai_v0 (default: glide_right)\n",
         prog);
 }
 
@@ -87,6 +107,7 @@ Options parse(int argc, char** argv) {
         else if (a == "--ready-timeout")       o.ready_timeout = ta::parse_double(ta::require_value(a, argc, argv, i), a);
         else if (a == "--stall-log-ms")        o.stall_log_ms = ta::parse_double(ta::require_value(a, argc, argv, i), a);
         else if (a == "--clear-error")         o.clear_error = true;
+        else if (a == "--model")               o.model_str = ta::require_value(a, argc, argv, i);
         else if (a == "--help" || a == "-h")   { usage(argv[0]); std::exit(0); }
         else throw std::runtime_error("unknown option: " + a);
     }
@@ -95,6 +116,7 @@ Options parse(int argc, char** argv) {
     o.leader_ip = ta::cli_env_or_default(o.leader_ip, "ADAMO_TROSSEN_LEADER_IP", kDefaultLeaderIp);
     if (o.rate_hz <= 0.0) throw std::runtime_error("--rate-hz must be positive");
     if (o.velocity_limit <= 0.0) throw std::runtime_error("--velocity-limit must be positive");
+    parse_model(o.model_str);
     return o;
 }
 
@@ -111,7 +133,8 @@ int main(int argc, char** argv) try {
     auto driver = ta::arm::configure(opt.leader_ip,
                                      trossen_arm::StandardEndEffector::wxai_v0_leader,
                                      opt.clear_error,
-                                     opt.connect_timeout);
+                                     opt.connect_timeout,
+                                     parse_model(opt.model_str));
 
     // From here on, any thrown exception (including handshake timeout,
     // driver fault, or external_effort-mode operation failures) must run
@@ -145,12 +168,13 @@ int main(int argc, char** argv) try {
     std::this_thread::sleep_for(std::chrono::seconds(1));
     driver->set_all_modes(trossen_arm::Mode::external_effort);
 
+    const bool glide_leader = is_glide(opt.model_str);
     const double teleop_started_at = ta::wire::now_seconds();
     const auto loop_end = std::chrono::steady_clock::now() +
                           std::chrono::duration<double>(opt.teleoperation_time);
 
     std::vector<std::uint8_t> effort_buf;     // reused; capacity stable after warm-up
-    std::vector<double> applied(ta::wire::kNumJoints, 0.0);
+    std::vector<double> applied(ta::wire::kNumJoints - 1, 0.0);  // joints 0-5
 
     while (!ta::stop_requested() && std::chrono::steady_clock::now() < loop_end) {
         const auto loop_start = std::chrono::steady_clock::now();
@@ -162,10 +186,26 @@ int main(int argc, char** argv) try {
             try {
                 const auto e = ta::wire::decode_efforts(effort_buf.data(), effort_buf.size());
                 if (e.timestamp >= teleop_started_at) {
-                    for (std::size_t i = 0; i < e.efforts.size(); ++i) {
+                    for (std::size_t i = 0; i < applied.size(); ++i) {
                         applied[i] = -opt.force_feedback_gain * e.efforts[i];
                     }
-                    driver->set_all_external_efforts(applied, 0.0, false);
+                    driver->set_arm_external_efforts(applied, 0.0, false);
+
+                    // Gripper (joint 6): Glide uses normalised cubic fit;
+                    // wxai_v0 applies scaled effort directly.
+                    if (glide_leader) {
+                        const double effort_norm =
+                            std::min(std::abs(e.efforts[ta::wire::kNumJoints - 1]) /
+                                         FOLLOWER_GRIPPER_MAX_EFFORT, 1.0);
+                        const double gripper_effort =
+                            LEADER_GRIPPER_MAX_EFFORT * std::pow(effort_norm, 3) +
+                            GRIPPER_EFFORT_OFFSET;
+                        driver->set_gripper_external_effort(gripper_effort, 0.2, false);
+                    } else {
+                        driver->set_gripper_external_effort(
+                            -opt.force_feedback_gain * e.efforts[ta::wire::kNumJoints - 1],
+                            0.2, false);
+                    }
                 }
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "leader: bad effort payload: %s\n", e.what());
@@ -179,10 +219,17 @@ int main(int argc, char** argv) try {
         // returns both (and more) in one cycle, halving the per-tick
         // contention window with the daemon.
         const auto out = driver->get_robot_output();
-        auto& positions  = out.joint.all.positions;
+        auto positions  = out.joint.all.positions;
         auto velocities  = out.joint.all.velocities;
         for (double& v : velocities) {
             v = std::clamp(v, -opt.velocity_limit, opt.velocity_limit);
+        }
+        if (glide_leader) {
+            positions[3] = -positions[3];
+            positions[4] = -positions[4];
+            positions[5] += (opt.model_str == "glide_left") ? -kDefaultJoint5Offset : kDefaultJoint5Offset;
+            velocities[3] = -velocities[3];
+            velocities[4] = -velocities[4];
         }
         const auto payload = ta::wire::encode_state(ta::wire::now_seconds(), positions, velocities);
         state_latest.put(payload.data(), payload.size());

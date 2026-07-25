@@ -23,10 +23,11 @@ inline std::unique_ptr<trossen_arm::TrossenArmDriver>
 configure(const std::string& ip,
           const trossen_arm::EndEffector& end_effector,
           bool clear_error,
-          double connect_timeout)
+          double connect_timeout,
+          trossen_arm::Model model = trossen_arm::Model::wxai_v0)
 {
     auto driver = std::make_unique<trossen_arm::TrossenArmDriver>();
-    driver->configure(trossen_arm::Model::wxai_v0,
+    driver->configure(model,
                       end_effector,
                       ip,
                       clear_error,

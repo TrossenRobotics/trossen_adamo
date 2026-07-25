@@ -2,7 +2,8 @@
 //
 // Drives the follower arm in `position` mode, tracks leader joint state from
 // the Adamo bus, publishes external efforts back, and (optionally) streams
-// the host's RealSense camera through the Adamo C SDK.
+// the host's camera (RealSense or Stereolabs ZED, via --camera-backend)
+// through the Adamo C SDK.
 
 #include "adamo/adamo.hpp"
 #include "libtrossen_arm/trossen_arm.hpp"
@@ -16,7 +17,8 @@
 #include "trossen_adamo/topics.hpp"
 #include "trossen_adamo/wire.hpp"
 
-#include "realsense_streamer.hpp"
+#include "trossen_adamo/realsense_streamer.hpp"
+#include "trossen_adamo/zed_streamer.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -42,6 +44,7 @@ struct Options {
     std::string robot;          // resolved to kDefaultRobot if neither CLI nor env set
     std::string follower_ip;    // resolved to kDefaultFollowerIp if neither CLI nor env set
     std::string protocol_str = "quic";
+    std::string model_str = "wxai_v0";  // wxai_v0 | pro
     double teleoperation_time = 20.0;
     double connect_timeout = 20.0;
     double ready_timeout = 60.0;
@@ -58,13 +61,37 @@ struct Options {
     double stats_interval_s = 1.0;       // periodic latency-stats interval; 0 disables
 
     bool        camera_enabled = true;
+    std::string camera_backend = "realsense";  // "realsense" | "zed"
     std::string camera_track = "main";
     std::string camera_serial;
     int         camera_width = 640;
     int         camera_height = 480;
     int         camera_fps = 30;
     int         camera_bitrate_kbps = 4000;
+    std::string camera_resolution_str = "SVGA";  // zed backend only
 };
+
+struct FollowerModelConfig {
+    trossen_arm::Model       model;
+    trossen_arm::EndEffector end_effector;
+};
+
+FollowerModelConfig parse_follower_model(const std::string& s) {
+    if (s == "wxai_v0") return {trossen_arm::Model::wxai_v0, trossen_arm::StandardEndEffector::wxai_v0_follower};
+    if (s == "pro")     return {trossen_arm::Model::pro,     trossen_arm::StandardEndEffector::pro_follower};
+    throw std::runtime_error("invalid --model: " + s + " (expected wxai_v0|pro)");
+}
+
+sl::RESOLUTION parse_zed_resolution(const std::string& s) {
+    if (s == "HD2K")   return sl::RESOLUTION::HD2K;
+    if (s == "HD1200") return sl::RESOLUTION::HD1200;
+    if (s == "HD1080") return sl::RESOLUTION::HD1080;
+    if (s == "HD720")  return sl::RESOLUTION::HD720;
+    if (s == "SVGA")   return sl::RESOLUTION::SVGA;
+    if (s == "VGA")    return sl::RESOLUTION::VGA;
+    throw std::runtime_error("invalid --camera-resolution: " + s +
+                             " (expected HD2K|HD1200|HD1080|HD720|SVGA|VGA)");
+}
 
 void usage(const char* prog) {
     std::fprintf(stderr,
@@ -85,6 +112,7 @@ void usage(const char* prog) {
         "  --ready-timeout SEC         (default: 60)\n"
         "  --stall-log-ms MS           (default: 50)\n"
         "  --clear-error               clear arm fault on connect\n"
+        "  --model NAME                wxai_v0|pro (default: wxai_v0)\n"
         "\n"
         "Smoothing options (applied to commanded follower positions):\n"
         "  --smooth-alpha A            EMA factor in (0,1]; 1.0 disables (default: 0.35)\n"
@@ -93,12 +121,14 @@ void usage(const char* prog) {
         "  --command-time SEC          controller goal_time during steady state (default: 0.02)\n"
         "  --stats-interval SEC        latency stats print interval; 0 disables (default: 1.0)\n"
         "\n"
-        "Camera options (RealSense color):\n"
+        "Camera options:\n"
         "  --no-camera                 disable the camera streamer\n"
+        "  --camera-backend NAME       realsense|zed (default: realsense)\n"
         "  --camera-track NAME         (default: main; e.g. main/front/rear/head/overlay)\n"
-        "  --camera-serial SERIAL      pin to a specific RealSense device\n"
-        "  --camera-width N            (default: 640)\n"
-        "  --camera-height N           (default: 480)\n"
+        "  --camera-serial SERIAL      pin to a specific device (RealSense serial or ZED serial)\n"
+        "  --camera-width N            RealSense only (default: 640)\n"
+        "  --camera-height N           RealSense only (default: 480)\n"
+        "  --camera-resolution RES     ZED only: HD2K|HD1200|HD1080|HD720|SVGA|VGA (default: SVGA)\n"
         "  --camera-fps N              (default: 30)\n"
         "  --camera-bitrate-kbps N     (default: 4000)\n",
         prog);
@@ -119,16 +149,19 @@ Options parse(int argc, char** argv) {
         else if (a == "--ready-timeout")       o.ready_timeout = ta::parse_double(ta::require_value(a, argc, argv, i), a);
         else if (a == "--stall-log-ms")        o.stall_log_ms = ta::parse_double(ta::require_value(a, argc, argv, i), a);
         else if (a == "--clear-error")         o.clear_error = true;
+        else if (a == "--model")               o.model_str = ta::require_value(a, argc, argv, i);
         else if (a == "--smooth-alpha")        o.smooth_alpha = ta::parse_double(ta::require_value(a, argc, argv, i), a);
         else if (a == "--max-step")            o.max_step = ta::parse_double(ta::require_value(a, argc, argv, i), a);
         else if (a == "--initial-sync-time")   o.initial_sync_time = ta::parse_double(ta::require_value(a, argc, argv, i), a);
         else if (a == "--command-time")        o.command_time = ta::parse_double(ta::require_value(a, argc, argv, i), a);
         else if (a == "--stats-interval")      o.stats_interval_s = ta::parse_double(ta::require_value(a, argc, argv, i), a);
         else if (a == "--no-camera")           o.camera_enabled = false;
+        else if (a == "--camera-backend")      o.camera_backend = ta::require_value(a, argc, argv, i);
         else if (a == "--camera-track")        o.camera_track = ta::require_value(a, argc, argv, i);
         else if (a == "--camera-serial")       o.camera_serial = ta::require_value(a, argc, argv, i);
         else if (a == "--camera-width")        o.camera_width = ta::parse_int(ta::require_value(a, argc, argv, i), a);
         else if (a == "--camera-height")       o.camera_height = ta::parse_int(ta::require_value(a, argc, argv, i), a);
+        else if (a == "--camera-resolution")   o.camera_resolution_str = ta::require_value(a, argc, argv, i);
         else if (a == "--camera-fps")          o.camera_fps = ta::parse_int(ta::require_value(a, argc, argv, i), a);
         else if (a == "--camera-bitrate-kbps") o.camera_bitrate_kbps = ta::parse_int(ta::require_value(a, argc, argv, i), a);
         else if (a == "--help" || a == "-h")   { usage(argv[0]); std::exit(0); }
@@ -138,6 +171,7 @@ Options parse(int argc, char** argv) {
     o.robot       = ta::cli_env_or_default(o.robot,       "ADAMO_ROBOT_NAME",          kDefaultRobot);
     o.follower_ip = ta::cli_env_or_default(o.follower_ip, "ADAMO_TROSSEN_FOLLOWER_IP", kDefaultFollowerIp);
     if (o.rate_hz <= 0.0) throw std::runtime_error("--rate-hz must be positive");
+    parse_follower_model(o.model_str);  // validate early
     if (!(o.smooth_alpha > 0.0 && o.smooth_alpha <= 1.0)) {
         throw std::runtime_error("--smooth-alpha must be in (0, 1]");
     }
@@ -148,8 +182,17 @@ Options parse(int argc, char** argv) {
     if (o.command_time < 0.0)      throw std::runtime_error("--command-time must be >= 0");
     if (o.stats_interval_s < 0.0)  throw std::runtime_error("--stats-interval must be >= 0");
     if (o.camera_enabled) {
-        if (o.camera_width <= 0 || o.camera_height <= 0 || o.camera_fps <= 0 || o.camera_bitrate_kbps <= 0) {
-            throw std::runtime_error("camera width/height/fps/bitrate must be positive");
+        if (o.camera_backend != "realsense" && o.camera_backend != "zed") {
+            throw std::runtime_error("--camera-backend must be realsense or zed");
+        }
+        if (o.camera_fps <= 0 || o.camera_bitrate_kbps <= 0) {
+            throw std::runtime_error("camera fps/bitrate must be positive");
+        }
+        if (o.camera_backend == "realsense" && (o.camera_width <= 0 || o.camera_height <= 0)) {
+            throw std::runtime_error("camera width/height must be positive");
+        }
+        if (o.camera_backend == "zed") {
+            parse_zed_resolution(o.camera_resolution_str);  // validate early
         }
     }
     return o;
@@ -165,10 +208,12 @@ int main(int argc, char** argv) try {
     const adamo::Protocol protocol = ta::args::parse_protocol(opt.protocol_str);
 
     std::cout << "follower: configuring arm at " << opt.follower_ip << "\n";
+    const auto model_cfg = parse_follower_model(opt.model_str);
     auto driver = ta::arm::configure(opt.follower_ip,
-                                     trossen_arm::StandardEndEffector::wxai_v0_follower,
+                                     model_cfg.end_effector,
                                      opt.clear_error,
-                                     opt.connect_timeout);
+                                     opt.connect_timeout,
+                                     model_cfg.model);
 
     // Park guard fires on every exit path (normal return, thrown
     // handshake timeout, decode/driver fault, signal-driven loop break).
@@ -178,22 +223,38 @@ int main(int argc, char** argv) try {
     ta::arm::ArmParkGuard park_guard(*driver, "follower");
 
     // Bring up the camera streamer first so the operator's video link is up
-    // by the time teleop begins.
-    std::unique_ptr<ta::camera::RealSenseStreamer> streamer;
+    // by the time teleop begins. Exactly one of these is constructed,
+    // selected by --camera-backend; only one runs regardless of which.
+    std::unique_ptr<ta::camera::RealSenseStreamer> rs_streamer;
+    std::unique_ptr<ta::camera::ZedStreamer> zed_streamer;
     if (opt.camera_enabled) {
 #ifdef ADAMO_HAS_VIDEO
-        ta::camera::Config c;
-        c.api_key      = opt.api_key;
-        c.robot        = opt.robot;
-        c.track        = opt.camera_track;
-        c.serial       = opt.camera_serial;
-        c.width        = opt.camera_width;
-        c.height       = opt.camera_height;
-        c.fps          = opt.camera_fps;
-        c.bitrate_kbps = opt.camera_bitrate_kbps;
-        c.protocol     = protocol;
-        streamer = std::make_unique<ta::camera::RealSenseStreamer>(std::move(c));
-        streamer->start();
+        if (opt.camera_backend == "realsense") {
+            ta::camera::Config c;
+            c.api_key      = opt.api_key;
+            c.robot        = opt.robot;
+            c.track        = opt.camera_track;
+            c.serial       = opt.camera_serial;
+            c.width        = opt.camera_width;
+            c.height       = opt.camera_height;
+            c.fps          = opt.camera_fps;
+            c.bitrate_kbps = opt.camera_bitrate_kbps;
+            c.protocol     = protocol;
+            rs_streamer = std::make_unique<ta::camera::RealSenseStreamer>(std::move(c));
+            rs_streamer->start();
+        } else {
+            ta::camera::ZedConfig c;
+            c.api_key      = opt.api_key;
+            c.robot        = opt.robot;
+            c.track        = opt.camera_track;
+            c.serial       = opt.camera_serial;
+            c.resolution   = parse_zed_resolution(opt.camera_resolution_str);
+            c.fps          = opt.camera_fps;
+            c.bitrate_kbps = opt.camera_bitrate_kbps;
+            c.protocol     = protocol;
+            zed_streamer = std::make_unique<ta::camera::ZedStreamer>(std::move(c));
+            zed_streamer->start();
+        }
 #else
         std::fprintf(stderr,
             "follower: camera requested but Adamo was built without ADAMO_BUILD_VIDEO; "
@@ -320,7 +381,8 @@ int main(int argc, char** argv) try {
     effort_latest.close();
 
     std::cout << "follower: returning home + sleep\n";
-    if (streamer) streamer->stop();
+    if (rs_streamer)  rs_streamer->stop();
+    if (zed_streamer) zed_streamer->stop();
     // park_guard runs here as we return: position mode, home, sleep.
     return 0;
 } catch (const std::exception& e) {
