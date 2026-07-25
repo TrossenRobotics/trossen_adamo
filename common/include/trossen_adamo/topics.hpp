@@ -27,4 +27,18 @@ inline std::string vr_state_of(const std::string& robot) {
     return robot + "/trossen/reference/vr_state";
 }
 
+// Bimanual-specific topics: left and right arm channels.
+inline std::string state_left_of(const std::string& robot) {
+    return robot + "/trossen/reference/leader_state_left";
+}
+inline std::string state_right_of(const std::string& robot) {
+    return robot + "/trossen/reference/leader_state_right";
+}
+inline std::string effort_left_of(const std::string& robot) {
+    return robot + "/trossen/reference/follower_effort_left";
+}
+inline std::string effort_right_of(const std::string& robot) {
+    return robot + "/trossen/reference/follower_effort_right";
+}
+
 }  // namespace trossen_adamo::topics

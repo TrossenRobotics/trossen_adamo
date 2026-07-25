@@ -1,0 +1,36 @@
+find_package(realsense2 REQUIRED)
+find_package(ZED 4 REQUIRED)
+find_package(CUDA REQUIRED)
+
+add_executable(bimanual_follower
+    bimanual_follower.cpp
+)
+
+target_include_directories(bimanual_follower PRIVATE
+    ${ZED_INCLUDE_DIRS}
+    ${CUDA_INCLUDE_DIRS}
+)
+
+target_link_directories(bimanual_follower PRIVATE
+    ${ZED_LIBRARY_DIR}
+    ${CUDA_LIBRARY_DIRS}
+)
+
+target_link_libraries(bimanual_follower
+    PRIVATE
+        trossen_adamo_common
+        realsense2::realsense2
+        ${ZED_LIBRARIES}
+        ${CUDA_LIBRARIES}
+)
+
+# Propagate the realsense lib dir to RPATH so the binary finds it at runtime.
+if(realsense2_DIR)
+    get_filename_component(_rs_prefix "${realsense2_DIR}/../../.." ABSOLUTE)
+    set_target_properties(bimanual_follower PROPERTIES
+        BUILD_RPATH "${_rs_prefix}/lib"
+    )
+endif()
+
+include(GNUInstallDirs)
+install(TARGETS bimanual_follower RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

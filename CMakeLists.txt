@@ -20,6 +20,8 @@ option(ADAMO_TROSSEN_BUILD_LEADER   "Build the trossen_leader binary"   ON)
 option(ADAMO_TROSSEN_BUILD_FOLLOWER "Build the trossen_follower binary" ON)
 option(ADAMO_TROSSEN_BUILD_VR_HEADSET "Build the vr_headset binary" ON)
 option(ADAMO_TROSSEN_BUILD_VR_FOLLOWER "Build the vr_follower binary" ON)
+option(ADAMO_TROSSEN_BUILD_BIMANUAL_LEADER   "Build the bimanual_leader binary"   ON)
+option(ADAMO_TROSSEN_BUILD_BIMANUAL_FOLLOWER "Build the bimanual_follower binary" ON)
 
 # ---------------------------------------------------------------------------
 # Adamo C SDK — resolved via find_package(Adamo CONFIG).
@@ -89,6 +91,12 @@ option(ADAMO_TROSSEN_BUILD_VR_BIMANUAL "Build VR bimanual binary" OFF)
 if(ADAMO_TROSSEN_BUILD_VR_BIMANUAL)
     add_subdirectory(vr_bimanual)
 endif()
+if(ADAMO_TROSSEN_BUILD_BIMANUAL_LEADER)
+    add_subdirectory(bimanual_leader)
+endif()
+if(ADAMO_TROSSEN_BUILD_BIMANUAL_FOLLOWER)
+    add_subdirectory(bimanual_follower)
+endif()
 
 # libadamo ships with install_name @rpath/libadamo.dylib (macOS) and
 # DT_SONAME libadamo.so (Linux). Both need the loader to find the file via
@@ -100,7 +108,7 @@ endif()
 get_target_property(_adamo_loc Adamo::adamo IMPORTED_LOCATION)
 if(_adamo_loc)
     get_filename_component(_adamo_dir "${_adamo_loc}" DIRECTORY)
-    foreach(_target trossen_leader trossen_follower vr_headset vr_follower vr_bimanual)
+    foreach(_target trossen_leader trossen_follower vr_headset vr_follower vr_bimanual bimanual_leader bimanual_follower)
         if(TARGET ${_target})
             set_property(TARGET ${_target} APPEND PROPERTY BUILD_RPATH "${_adamo_dir}")
         endif()
