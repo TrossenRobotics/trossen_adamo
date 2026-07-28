@@ -1,17 +1,19 @@
 # trossen_adamo
 
 The official [Adamo](https://adamohq.com) integration for Trossen Robotics'
-WidowX AI follower/leader teleop. Built by Adamo so Trossen hosts can deploy
+WidowX AI, Pro, and Glide follower/leader teleop. Built by Adamo so Trossen hosts can deploy
 Adamo teleop, recording, and replay against `libtrossen_arm` arms out of the
-box. Five binaries built from one CMake project:
+box. Seven binaries built from one CMake project:
 
-| Binary             | Talks to                                                         |
-| ------------------ | ---------------------------------------------------------------- |
-| `trossen_leader`   | leader arm via `libtrossen_arm`, Adamo pubsub                    |
-| `trossen_follower` | follower arm via `libtrossen_arm`, Adamo pubsub, RealSense video |
-| `vr_headset`       | Meta Quest VR headset via UDP (trossen_vr), Adamo pubsub         |
-| `vr_follower`      | follower arm via `libtrossen_arm`, Adamo pubsub (VR control)     |
-| `vr_bimanual`      | both follower arms via `libtrossen_arm`, Adamo pubsub (VR control) |
+| Binary               | Talks to                                                                                             |
+| -------------------- | ---------------------------------------------------------------------------------------------------- |
+| `trossen_leader`     | leader arm via `libtrossen_arm`, Adamo pubsub — Glide or wxai_v0 (`--model`)                        |
+| `trossen_follower`   | follower arm via `libtrossen_arm`, Adamo pubsub — wxai_v0 or Pro (`--model`), RealSense or ZED video (`--camera-backend`) |
+| `bimanual_leader`    | two leader arms via `libtrossen_arm`, Adamo pubsub — per-arm Glide or wxai_v0 (`--left-model`/`--right-model`) |
+| `bimanual_follower`  | two follower arms via `libtrossen_arm`, Adamo pubsub — per-arm wxai_v0 or Pro, up to 4 RealSense or 3 ZED cameras |
+| `vr_headset`         | Meta Quest VR headset via UDP (trossen_vr), Adamo pubsub                                             |
+| `vr_follower`        | follower arm via `libtrossen_arm`, Adamo pubsub (VR control)                                         |
+| `vr_bimanual`        | both follower arms via `libtrossen_arm`, Adamo pubsub (VR control)                                   |
 
 For container builds (multi-arch Linux images), see [`docker/README.md`](docker/README.md).
 
@@ -26,7 +28,40 @@ Two binaries on two hosts, talking over Adamo's pubsub bus:
   feedback from the follower.
 - `trossen_follower` runs the follower arm in `position` mode, EMA-smooths
   incoming leader poses, publishes its own external efforts back, and
-  (optionally) streams a RealSense color track to Adamo.
+  (optionally) streams a color track to Adamo — RealSense or Stereolabs ZED,
+  selected via `--camera-backend` (default `realsense`).
+
+`trossen_leader` accepts `--model glide_right|glide_left|wxai_v0`
+(default `glide_right`). A Glide leader talking to a wxai_v0/Pro follower
+needs a joint-frame correction (Glide's joints 3/4 are mirrored relative to
+wxai_v0's convention; joint 5 has a fixed grip-alignment offset of π/4) —
+applied automatically before the pose goes on the wire whenever `--model` is a
+Glide variant. Gripper force feedback differs per model: Glide uses a
+normalised cubic fit; wxai_v0 applies the scaled effort directly.
+
+`trossen_follower` accepts `--model wxai_v0|pro` (default `wxai_v0`) to select
+the correct end-effector configuration for wxai_v0 or Pro follower arms.
+
+### Bimanual Teleop
+
+Two binaries on two hosts, each driving **two** arms (right + left) — the
+same joint-space architecture as the single-arm pair above:
+
+- `bimanual_leader` drives two leader arms. Each arm is configured
+  independently via `--left-model glide_left|wxai_v0` and
+  `--right-model glide_right|wxai_v0` (defaults: `glide_left`/`glide_right`).
+  The Glide frame correction is applied per-arm: right's joint-5 offset is
+  `+π/4`, left's is `−π/4`. Gripper feedback is model-aware per arm (cubic
+  fit for Glide, direct scale for wxai_v0).
+- `bimanual_follower` drives two follower arms, each configured independently
+  via `--left-model wxai_v0|pro` and `--right-model wxai_v0|pro` (default
+  `wxai_v0`). It EMA-smooths each arm's incoming pose independently and
+  streams up to **4 RealSense** or **3 ZED** cameras (`--camera-backend`,
+  `--num-cameras`, `--camera-track-N`, `--camera-serial-N` flags, N=0..3).
+
+Left/right state and effort topics are namespaced with `_left`/`_right`
+suffixes under the same robot name; both arms share a single ready-handshake
+pair.
 
 ### VR Teleoperation
 
@@ -59,23 +94,31 @@ Adamo work.
 ## Build
 
 ```sh
-cmake -S . -B build
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH="/path/to/adamo-sdk;/usr/local/zed" \
+  -DTROSSEN_ARM_DIR=/path/to/trossen_arm/build/install
 cmake --build build --parallel
 ```
 
-Binaries land at `build/{leader,follower,vr_headset,vr_follower,vr_bimanual}/`.
+Binaries land at
+`build/{leader,follower,bimanual_leader,bimanual_follower,vr_headset,vr_follower,vr_bimanual}/`.
 
 Useful flags:
 
-- `-DADAMO_TROSSEN_BUILD_FOLLOWER=OFF` / `-DADAMO_TROSSEN_BUILD_LEADER=OFF` — skip arm teleop binaries.
+- `-DADAMO_TROSSEN_BUILD_FOLLOWER=OFF` / `-DADAMO_TROSSEN_BUILD_LEADER=OFF` — skip single-arm teleop binaries.
+- `-DADAMO_TROSSEN_BUILD_BIMANUAL_LEADER=OFF` / `-DADAMO_TROSSEN_BUILD_BIMANUAL_FOLLOWER=OFF` — skip bimanual binaries.
 - `-DADAMO_TROSSEN_BUILD_VR_HEADSET=OFF` / `-DADAMO_TROSSEN_BUILD_VR_FOLLOWER=OFF` / `-DADAMO_TROSSEN_BUILD_VR_BIMANUAL=OFF` — skip VR binaries.
-- `-DCMAKE_PREFIX_PATH=/abs/path/extracted-sdk` — point CMake at an Adamo SDK install (tarballs at <https://install.adamohq.com/sdk/v0.1.34/>).
-- `-DTROSSEN_ARM_GIT_TAG=<ref>` — pin the upstream `libtrossen_arm` ref (default `v1.10.0`).
+- `-DCMAKE_PREFIX_PATH=/abs/path/extracted-sdk` — point CMake at an Adamo SDK install (tarballs at <https://install.adamohq.com/sdk/>).
+- `-DTROSSEN_ARM_GIT_TAG=<ref>` — pin the upstream `libtrossen_arm` ref.
 - `-Drealsense2_DIR=/abs/path/lib/cmake/realsense2` — for non-system librealsense.
 
-`librealsense2` is required only for the follower (`brew install librealsense`
-on macOS, `apt install librealsense2-dev` on Linux). VR binaries require
-`trossen_vr` (install to `/usr/local` via `sudo make install`).
+`librealsense2` is required for both `trossen_follower` and `bimanual_follower`
+(`brew install librealsense` on macOS,`apt install librealsense2-dev` on Linux). Using `--camera-backend zed`
+additionally requires the Stereolabs **ZED SDK v4** + CUDA (installed at
+`/usr/local/zed` on Jetson/L4T hosts; add that prefix to `CMAKE_PREFIX_PATH`
+if not found automatically). VR binaries require `trossen_vr` (install to
+`/usr/local` via `sudo make install`).
 
 ## Run
 
@@ -95,23 +138,29 @@ Defaults (override via env var or CLI flag — CLI > env > default):
 handshake), then the leader. Either side blocks until both have published a
 fresh `*_ready` heartbeat.
 
-**Follower** (needs `sudo -E` on macOS so librealsense can claim the USB device):
+**Follower** (wxai_v0 arm, RealSense camera):
 
 ```sh
-sudo -E build/follower/trossen_follower \
+build/follower/trossen_follower \
     --teleoperation-time 86400 \
     --rate-hz 100 \
     --clear-error \
     --protocol quic \
+    --follower-ip 192.168.1.3 \
+    --model wxai_v0 \
+    --camera-backend realsense \
     --camera-width 640 --camera-height 480 --camera-fps 30 \
     --camera-bitrate-kbps 4000
 ```
 
-- `--no-camera` — skip the RealSense streamer (bench-test arms only).
-- `--camera-track NAME` — override the published track name (default `main`).
-  Adamo's operator UI groups tracks by these names (`main`/`front`/`rear`/
-  `head`/`overlay`).
-- `--camera-serial <SN>` — pin to a specific RealSense if multiple are plugged in.
+Key follower options:
+- `--model wxai_v0|pro` — arm model (default `wxai_v0`).
+- `--no-camera` — skip the camera streamer (bench-test arms only).
+- `--camera-backend realsense|zed` — which camera to stream (default `realsense`).
+- `--camera-track NAME` — published track name (default `main`).
+- `--camera-serial <SN>` — pin to a specific device if multiple are plugged in.
+- `--camera-width`/`--camera-height` — RealSense only (default 640×480).
+- `--camera-resolution HD2K|HD1200|HD1080|HD720|SVGA|VGA` — ZED only (default `SVGA`).
 
 **Leader**:
 
@@ -121,11 +170,81 @@ build/leader/trossen_leader \
     --rate-hz 100 \
     --velocity-limit 3.0 \
     --clear-error \
-    --protocol quic
+    --protocol quic \
+    --leader-ip 192.168.1.2 \
+    --model glide_right
 ```
+
+- `--model glide_right|glide_left|wxai_v0` — arm model (default `glide_right`).
 
 `Ctrl-C` on either side unwinds both cleanly (move-home → sleep). `--help` on
 either binary prints the full flag list.
+
+### Bimanual Classical Teleop
+
+Defaults (override via env var or CLI flag — CLI > env > default):
+
+| Setting            | Default       | Env                                  | Flag                  |
+| ------------------ | ------------- | ------------------------------------ | --------------------- |
+| Robot name         | `wxai`        | `ADAMO_ROBOT_NAME`                   | `--robot`             |
+| Right leader IP    | `192.168.1.2` | `ADAMO_TROSSEN_RIGHT_LEADER_IP`      | `--right-leader-ip`   |
+| Left leader IP     | `192.168.1.4` | `ADAMO_TROSSEN_LEFT_LEADER_IP`       | `--left-leader-ip`    |
+| Right follower IP  | `192.168.1.3` | `ADAMO_TROSSEN_RIGHT_FOLLOWER_IP`    | `--right-follower-ip` |
+| Left follower IP   | `192.168.1.5` | `ADAMO_TROSSEN_LEFT_FOLLOWER_IP`     | `--left-follower-ip`  |
+
+Same start order: start `bimanual_follower` first, then `bimanual_leader`.
+
+**Bimanual Follower** (ZED cameras — pin a serial per camera so multiple
+streamers don't race for the same physical device):
+
+```sh
+build/bimanual_follower/bimanual_follower \
+    --teleoperation-time 86400 \
+    --rate-hz 100 \
+    --clear-error \
+    --protocol quic \
+    --left-follower-ip 192.168.1.5 \
+    --right-follower-ip 192.168.1.3 \
+    --left-model wxai_v0 \
+    --right-model wxai_v0 \
+    --camera-backend zed \
+    --num-cameras 3 \
+    --camera-track-0 cam0 --camera-serial-0 <SN0> \
+    --camera-track-1 cam1 --camera-serial-1 <SN1> \
+    --camera-track-2 cam2 --camera-serial-2 <SN2> \
+    --camera-resolution SVGA --camera-fps 30 \
+    --camera-bitrate-kbps 4000
+```
+
+Key bimanual follower options:
+- `--left-model wxai_v0|pro` / `--right-model wxai_v0|pro` — per-arm model (default `wxai_v0`).
+- `--camera-backend realsense|zed` — camera backend (default `realsense`).
+- `--num-cameras N` — 1–4 for RealSense, 1–3 for ZED (default `3`).
+- `--camera-track-N NAME` / `--camera-serial-N SERIAL` — per-camera track name and serial (N = 0, 1, 2, 3).
+- `--camera-width`/`--camera-height` — RealSense only (default 640×480).
+- `--camera-resolution HD2K|HD1200|HD1080|HD720|SVGA|VGA` — ZED only (default `SVGA`).
+- `--no-camera` — disable all camera streamers.
+
+**Bimanual Leader** (Glide arms; right's joint-5 offset is `+π/4`, left's
+is `−π/4` — applied automatically per side):
+
+```sh
+build/bimanual_leader/bimanual_leader \
+    --teleoperation-time 86400 \
+    --rate-hz 100 \
+    --velocity-limit 3.0 \
+    --clear-error \
+    --protocol quic \
+    --left-leader-ip 192.168.1.4 \
+    --right-leader-ip 192.168.1.2 \
+    --left-model glide_left \
+    --right-model glide_right
+```
+
+- `--left-model glide_left|wxai_v0` / `--right-model glide_right|wxai_v0` — per-arm model (defaults: `glide_left`/`glide_right`).
+
+`Ctrl-C` on either side unwinds both arms on that host cleanly (move-home →
+sleep). `--help` on either binary prints the full flag list.
 
 ### VR Teleoperation
 
@@ -163,10 +282,10 @@ build/vr_bimanual/vr_bimanual \
 
 **VR Controls:**
 - **Grip/hand trigger**: Engage arm (hold to control, release to pause)
-- **Index trigger**: Control gripper (0.0-1.0 → 0-40mm opening)
+- **Index trigger**: Control gripper (0.0–1.0 → 0–40 mm opening)
 - **Button B** (right) or **Y** (left): Exit teleoperation
 
-**Defaults:**
+**VR Defaults:**
 - Robot name: `vr_teleop` (override via `--robot` or env `ADAMO_ROBOT_NAME`)
 - Single-arm follower IP: `192.168.1.3` (override via `--follower-ip` or env `ADAMO_TROSSEN_FOLLOWER_IP`)
 - Bimanual right arm IP: `192.168.1.4` (override via `--right-arm-ip` or env `ADAMO_TROSSEN_RIGHT_ARM_IP`)
@@ -191,3 +310,5 @@ Built and maintained by [Adamo](https://adamohq.com) for Trossen Robotics.
 [MIT](LICENSE). The Adamo C SDK (`libadamo`) is redistributed under its own
 terms; see <https://install.adamohq.com>. `libtrossen_arm` is fetched from
 [TrossenRobotics/trossen_arm](https://github.com/TrossenRobotics/trossen_arm).
+
+
