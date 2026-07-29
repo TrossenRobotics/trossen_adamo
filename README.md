@@ -96,7 +96,7 @@ Adamo work.
 ```sh
 cmake -S . -B build \
   -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_PREFIX_PATH="/path/to/adamo-sdk;/usr/local/zed" \
+  -DCMAKE_PREFIX_PATH="/path/to/adamo-sdk;/path/to/zed" \
   -DTROSSEN_ARM_DIR=/path/to/trossen_arm/build/install
 cmake --build build --parallel
 ```

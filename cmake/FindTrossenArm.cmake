@@ -65,7 +65,13 @@ endif()
 # ---------------------------------------------------------------------------
 set(TROSSEN_ARM_DIR "" CACHE PATH "Path to a libtrossen_arm checkout/install")
 if(TROSSEN_ARM_DIR AND EXISTS "${TROSSEN_ARM_DIR}/include/libtrossen_arm/trossen_arm.hpp")
+    # Accept two layouts:
+    #   1. Upstream source tree:  lib/<os>/<arch>/libtrossen_arm.a
+    #   2. CMake install prefix:  lib/libtrossen_arm.a  (flat)
     set(_trossen_lib "${TROSSEN_ARM_DIR}/lib/${_trossen_os}/${_trossen_arch}/libtrossen_arm.a")
+    if(NOT EXISTS "${_trossen_lib}")
+        set(_trossen_lib "${TROSSEN_ARM_DIR}/lib/libtrossen_arm.a")
+    endif()
     if(EXISTS "${_trossen_lib}")
         add_library(_trossen_arm_imported STATIC IMPORTED)
         set_target_properties(_trossen_arm_imported PROPERTIES
@@ -76,13 +82,21 @@ if(TROSSEN_ARM_DIR AND EXISTS "${TROSSEN_ARM_DIR}/include/libtrossen_arm/trossen
             target_link_libraries(_trossen_arm_imported INTERFACE pthread)
         endif()
         add_library(TrossenArm::TrossenArm ALIAS _trossen_arm_imported)
-        message(STATUS "TrossenArm: using checkout at ${TROSSEN_ARM_DIR}")
+        message(STATUS "TrossenArm: using local install at ${TROSSEN_ARM_DIR}")
         return()
     else()
-        message(WARNING
-            "TrossenArm: TROSSEN_ARM_DIR set but ${_trossen_lib} is missing; "
-            "falling back to FetchContent.")
+        message(FATAL_ERROR
+            "TrossenArm: TROSSEN_ARM_DIR is set to '${TROSSEN_ARM_DIR}' but no library was found.\n"
+            "Expected one of:\n"
+            "  ${TROSSEN_ARM_DIR}/lib/${_trossen_os}/${_trossen_arch}/libtrossen_arm.a\n"
+            "  ${TROSSEN_ARM_DIR}/lib/libtrossen_arm.a\n"
+            "Check TROSSEN_ARM_DIR points to a built/installed libtrossen_arm.")
     endif()
+elseif(TROSSEN_ARM_DIR)
+    message(FATAL_ERROR
+        "TrossenArm: TROSSEN_ARM_DIR is set to '${TROSSEN_ARM_DIR}' but "
+        "'${TROSSEN_ARM_DIR}/include/libtrossen_arm/trossen_arm.hpp' was not found.\n"
+        "Check TROSSEN_ARM_DIR points to a built/installed libtrossen_arm.")
 endif()
 
 # ---------------------------------------------------------------------------
