@@ -109,16 +109,18 @@ Useful flags:
 - `-DADAMO_TROSSEN_BUILD_FOLLOWER=OFF` / `-DADAMO_TROSSEN_BUILD_LEADER=OFF` — skip single-arm teleop binaries.
 - `-DADAMO_TROSSEN_BUILD_BIMANUAL_LEADER=OFF` / `-DADAMO_TROSSEN_BUILD_BIMANUAL_FOLLOWER=OFF` — skip bimanual binaries.
 - `-DADAMO_TROSSEN_BUILD_VR_HEADSET=OFF` / `-DADAMO_TROSSEN_BUILD_VR_FOLLOWER=OFF` / `-DADAMO_TROSSEN_BUILD_VR_BIMANUAL=OFF` — skip VR binaries.
+- `-DADAMO_TROSSEN_ENABLE_REALSENSE=OFF` / `-DADAMO_TROSSEN_ENABLE_ZED=OFF` — disable a camera backend so `trossen_follower`/`bimanual_follower` don't need that SDK at all (both default `ON`; each is independent, so a ZED-only build never needs `librealsense2` and a RealSense-only build never needs the ZED SDK/CUDA).
 - `-DCMAKE_PREFIX_PATH=/abs/path/extracted-sdk` — point CMake at an Adamo SDK install (tarballs at <https://install.adamohq.com/sdk/>).
 - `-DTROSSEN_ARM_GIT_TAG=<ref>` — pin the upstream `libtrossen_arm` ref.
 - `-Drealsense2_DIR=/abs/path/lib/cmake/realsense2` — for non-system librealsense.
 
-`librealsense2` is required for both `trossen_follower` and `bimanual_follower`
-(`brew install librealsense` on macOS,`apt install librealsense2-dev` on Linux). Using `--camera-backend zed`
-additionally requires the Stereolabs **ZED SDK v4** + CUDA (installed at
-`/usr/local/zed` on Jetson/L4T hosts; add that prefix to `CMAKE_PREFIX_PATH`
-if not found automatically). VR binaries require `trossen_vr` (install to
-`/usr/local` via `sudo make install`).
+`librealsense2` is required for `trossen_follower`/`bimanual_follower` only when
+`ADAMO_TROSSEN_ENABLE_REALSENSE` is `ON` (the default; `brew install librealsense`
+on macOS, `apt install librealsense2-dev` on Linux). The Stereolabs **ZED SDK
+v4** + CUDA are required only when `ADAMO_TROSSEN_ENABLE_ZED` is `ON` (also the
+default; installed at `/usr/local/zed` on Jetson/L4T hosts — add that prefix to
+`CMAKE_PREFIX_PATH` if not found automatically). VR binaries require
+`trossen_vr` (install to `/usr/local` via `sudo make install`).
 
 ## Run
 

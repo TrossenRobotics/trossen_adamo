@@ -28,8 +28,12 @@
 #include "trossen_adamo/topics.hpp"
 #include "trossen_adamo/wire.hpp"
 
+#ifdef ADAMO_TROSSEN_HAS_REALSENSE
 #include "trossen_adamo/realsense_streamer.hpp"
+#endif
+#ifdef ADAMO_TROSSEN_HAS_ZED
 #include "trossen_adamo/zed_streamer.hpp"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -78,7 +82,13 @@ struct Options {
 
     // Camera options.
     bool        camera_enabled  = true;
+#if defined(ADAMO_TROSSEN_HAS_REALSENSE)
     std::string camera_backend  = "realsense";  // "realsense" | "zed"
+#elif defined(ADAMO_TROSSEN_HAS_ZED)
+    std::string camera_backend  = "zed";        // "realsense" | "zed"
+#else
+    std::string camera_backend;                 // no backend compiled in
+#endif
     int         num_cameras     = 3;
     // Per-camera track names and serial numbers (indices 0..num_cameras-1).
     std::array<std::string, kMaxCamerasRealSense> camera_tracks  = {"cam0", "cam1", "cam2", "cam3"};
@@ -103,6 +113,7 @@ FollowerModelConfig parse_follower_model(const std::string& s) {
     throw std::runtime_error("invalid --model: " + s + " (expected wxai_v0|pro)");
 }
 
+#ifdef ADAMO_TROSSEN_HAS_ZED
 sl::RESOLUTION parse_zed_resolution(const std::string& s) {
     if (s == "HD2K")   return sl::RESOLUTION::HD2K;
     if (s == "HD1200") return sl::RESOLUTION::HD1200;
@@ -113,6 +124,7 @@ sl::RESOLUTION parse_zed_resolution(const std::string& s) {
     throw std::runtime_error("invalid --camera-resolution: " + s +
                              " (expected HD2K|HD1200|HD1080|HD720|SVGA|VGA)");
 }
+#endif
 
 void usage(const char* prog) {
     std::fprintf(stderr,
@@ -146,7 +158,15 @@ void usage(const char* prog) {
         "\n"
         "Camera options:\n"
         "  --no-camera                      disable all camera streamers\n"
+#if defined(ADAMO_TROSSEN_HAS_REALSENSE) && defined(ADAMO_TROSSEN_HAS_ZED)
         "  --camera-backend NAME            realsense|zed (default: realsense)\n"
+#elif defined(ADAMO_TROSSEN_HAS_REALSENSE)
+        "  --camera-backend NAME            realsense (only backend this build supports)\n"
+#elif defined(ADAMO_TROSSEN_HAS_ZED)
+        "  --camera-backend NAME            zed (only backend this build supports)\n"
+#else
+        "  --camera-backend NAME            (none — this build has no camera backend compiled in)\n"
+#endif
         "  --num-cameras N                  1-4 for realsense, 1-3 for zed (default: 3)\n"
         "  --camera-track-0 NAME            track name for camera 0 (default: cam0)\n"
         "  --camera-track-1 NAME            track name for camera 1 (default: cam1)\n"
@@ -223,9 +243,21 @@ Options parse(int argc, char** argv) {
     if (o.command_time < 0.0)      throw std::runtime_error("--command-time must be >= 0");
     if (o.stats_interval_s < 0.0)  throw std::runtime_error("--stats-interval must be >= 0");
     if (o.camera_enabled) {
+#if defined(ADAMO_TROSSEN_HAS_REALSENSE) && defined(ADAMO_TROSSEN_HAS_ZED)
         if (o.camera_backend != "realsense" && o.camera_backend != "zed") {
             throw std::runtime_error("--camera-backend must be realsense or zed");
         }
+#elif defined(ADAMO_TROSSEN_HAS_REALSENSE)
+        if (o.camera_backend != "realsense") {
+            throw std::runtime_error("--camera-backend must be realsense (this build was compiled without ZED support)");
+        }
+#elif defined(ADAMO_TROSSEN_HAS_ZED)
+        if (o.camera_backend != "zed") {
+            throw std::runtime_error("--camera-backend must be zed (this build was compiled without RealSense support)");
+        }
+#else
+        throw std::runtime_error("camera requested but this build has no camera backend compiled in; pass --no-camera");
+#endif
         const int max_cam = (o.camera_backend == "zed") ? kMaxCamerasZed : kMaxCamerasRealSense;
         if (o.num_cameras < 1 || o.num_cameras > max_cam) {
             throw std::runtime_error("--num-cameras must be 1-" + std::to_string(max_cam) +
@@ -237,9 +269,11 @@ Options parse(int argc, char** argv) {
         if (o.camera_backend == "realsense" && (o.camera_width <= 0 || o.camera_height <= 0)) {
             throw std::runtime_error("camera width/height must be positive");
         }
+#ifdef ADAMO_TROSSEN_HAS_ZED
         if (o.camera_backend == "zed") {
             parse_zed_resolution(o.camera_resolution_str);  // validate early
         }
+#endif
     }
     return o;
 }
@@ -341,13 +375,21 @@ int main(int argc, char** argv) try {
 
     // Start camera streamers before opening the Adamo session so the operator's
     // video link is up by the time teleop begins. Each camera runs its own
-    // dedicated streamer with a distinct track name.
+    // dedicated streamer with a distinct track name. Each vector only exists
+    // when its backend was compiled in (ADAMO_TROSSEN_HAS_REALSENSE/_ZED, see
+    // bimanual_follower/CMakeLists.txt).
+#ifdef ADAMO_TROSSEN_HAS_REALSENSE
     std::vector<std::unique_ptr<ta::camera::RealSenseStreamer>> rs_streamers;
+#endif
+#ifdef ADAMO_TROSSEN_HAS_ZED
     std::vector<std::unique_ptr<ta::camera::ZedStreamer>>       zed_streamers;
+#endif
 
     if (opt.camera_enabled) {
 #ifdef ADAMO_HAS_VIDEO
-        if (opt.camera_backend == "realsense") {
+        bool started = false;
+#ifdef ADAMO_TROSSEN_HAS_REALSENSE
+        if (!started && opt.camera_backend == "realsense") {
             for (int idx = 0; idx < opt.num_cameras; ++idx) {
                 ta::camera::Config c;
                 c.api_key      = opt.api_key;
@@ -363,7 +405,11 @@ int main(int argc, char** argv) try {
                 streamer->start();
                 rs_streamers.push_back(std::move(streamer));
             }
-        } else {
+            started = true;
+        }
+#endif
+#ifdef ADAMO_TROSSEN_HAS_ZED
+        if (!started && opt.camera_backend == "zed") {
             for (int idx = 0; idx < opt.num_cameras; ++idx) {
                 ta::camera::ZedConfig c;
                 c.api_key      = opt.api_key;
@@ -378,6 +424,14 @@ int main(int argc, char** argv) try {
                 streamer->start();
                 zed_streamers.push_back(std::move(streamer));
             }
+            started = true;
+        }
+#endif
+        if (!started) {
+            std::fprintf(stderr,
+                "bimanual_follower: --camera-backend '%s' is not supported by this build\n",
+                opt.camera_backend.c_str());
+            return 1;
         }
 #else
         std::fprintf(stderr,
@@ -489,8 +543,12 @@ int main(int argc, char** argv) try {
     effort_right_latest.close();
 
     std::cout << "bimanual_follower: returning home + sleep\n";
+#ifdef ADAMO_TROSSEN_HAS_REALSENSE
     for (auto& s : rs_streamers)  s->stop();
+#endif
+#ifdef ADAMO_TROSSEN_HAS_ZED
     for (auto& s : zed_streamers) s->stop();
+#endif
     // Park guards run here as we return: position mode, home, sleep.
     return 0;
 } catch (const std::exception& e) {
