@@ -55,6 +55,13 @@ flag, nothing here changes):
 
 Requires a Glide leader (only Glide has buttons).
 
+If the Glide leader's own driver faults, `trossen_leader` handles it without
+crashing: it tells the follower to stop and go home immediately, waits 2s,
+then attempts one clear. If that clear fails, or the leader faults again
+before SEL_1 was pressed to resume teleop, the leader exits — otherwise it
+waits for SEL_1 to resume normally. A fault after teleop has genuinely
+resumed is treated as new and goes through the same recovery again.
+
 ### Bimanual Teleop
 
 Two binaries on two hosts, each driving **two** arms (right + left) — the
@@ -260,6 +267,11 @@ build/bimanual_leader/bimanual_leader \
 
 `Ctrl-C` on either side unwinds both arms on that host cleanly (move-home →
 sleep). `--help` on either binary prints the full flag list.
+
+Each side's Glide leader self-recovers from its own driver faults the same
+way as the single-arm case above (independently — a fault on one side
+doesn't affect the other), and each side's `--button-gated` `bimanual_follower`
+behaves the same as the single-arm follower's SEL_1/SEL_2.
 
 ### VR Teleoperation
 

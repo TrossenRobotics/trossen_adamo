@@ -63,4 +63,18 @@ inline std::string error_recover_right_of(const std::string& robot) {
     return robot + "/trossen/reference/error_recover_right";
 }
 
+// Glide leader self-recovery: the leader publishes a pulse the moment its
+// own driver faults, telling the paired follower to stop (move home)
+// immediately rather than keep tracking a leader that's no longer sending
+// fresh state. Same payload convention as the topics above.
+inline std::string leader_fault_of(const std::string& robot) {
+    return robot + "/trossen/reference/leader_fault";
+}
+inline std::string leader_fault_left_of(const std::string& robot) {
+    return robot + "/trossen/reference/leader_fault_left";
+}
+inline std::string leader_fault_right_of(const std::string& robot) {
+    return robot + "/trossen/reference/leader_fault_right";
+}
+
 }  // namespace trossen_adamo::topics

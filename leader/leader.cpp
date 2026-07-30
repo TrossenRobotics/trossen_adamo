@@ -26,6 +26,7 @@
 #include <iostream>
 #include <string>
 #include <thread>
+#include <utility>
 
 namespace {
 
@@ -166,11 +167,13 @@ int main(int argc, char** argv) try {
     const auto follower_ready_topic= ta::topics::follower_ready_of(opt.robot);
     const auto teleop_toggle_topic = ta::topics::teleop_toggle_of(opt.robot);
     const auto error_recover_topic = ta::topics::error_recover_of(opt.robot);
+    const auto leader_fault_topic  = ta::topics::leader_fault_of(opt.robot);
     // Effort feedback runs on the SDK's receive thread, off the control loop.
     ta::LatestSubscriber effort_sub(session, effort_topic);
     auto ready_sub = session.subscribe(follower_ready_topic);
     auto teleop_toggle_pub = session.publisher(teleop_toggle_topic, 250, true, false);
     auto error_recover_pub = session.publisher(error_recover_topic, 250, true, false);
+    auto leader_fault_pub  = session.publisher(leader_fault_topic,  250, true, false);
 
     std::cout << "leader: moving to home\n";
     ta::arm::move_home(*driver);
@@ -206,6 +209,19 @@ int main(int argc, char** argv) try {
     ta::recovery::ButtonTrigger teleop_toggle_button(/*bit=*/0);  // SEL_1
     ta::recovery::ButtonTrigger error_recover_button(/*bit=*/1);  // SEL_2
 
+    // Glide-only: self-recovery if the leader's own driver faults. Guards
+    // the per-tick driver calls below; a fault triggers leader_fault_pub (so
+    // the follower stops/homes immediately) then a blocking clear attempt.
+    // Non-glide leaders are unaffected -- maybe_guard is a plain passthrough
+    // and exceptions propagate exactly as before.
+    ta::recovery::ArmFaultTracker fault_tracker("leader");
+    bool awaiting_start_since_clear = false;
+    auto maybe_guard = [&](auto&& fn) {
+        if (glide_leader) return fault_tracker.guard(std::forward<decltype(fn)>(fn));
+        fn();
+        return true;
+    };
+
     while (!ta::stop_requested() && std::chrono::steady_clock::now() < loop_end) {
         const auto loop_start = std::chrono::steady_clock::now();
 
@@ -216,26 +232,28 @@ int main(int argc, char** argv) try {
             try {
                 const auto e = ta::wire::decode_efforts(effort_buf.data(), effort_buf.size());
                 if (e.timestamp >= teleop_started_at) {
-                    for (std::size_t i = 0; i < applied.size(); ++i) {
-                        applied[i] = -opt.force_feedback_gain * e.efforts[i];
-                    }
-                    driver->set_arm_external_efforts(applied, 0.0, false);
+                    maybe_guard([&] {
+                        for (std::size_t i = 0; i < applied.size(); ++i) {
+                            applied[i] = -opt.force_feedback_gain * e.efforts[i];
+                        }
+                        driver->set_arm_external_efforts(applied, 0.0, false);
 
-                    // Gripper (joint 6): Glide uses normalised cubic fit;
-                    // wxai_v0 applies scaled effort directly.
-                    if (glide_leader) {
-                        const double effort_norm =
-                            std::min(std::abs(e.efforts[ta::wire::kNumJoints - 1]) /
-                                         FOLLOWER_GRIPPER_MAX_EFFORT, 1.0);
-                        const double gripper_effort =
-                            LEADER_GRIPPER_MAX_EFFORT * std::pow(effort_norm, 3) +
-                            GRIPPER_EFFORT_OFFSET;
-                        driver->set_gripper_effort(gripper_effort, 0.1, false);
-                    } else {
-                        driver->set_gripper_external_effort(
-                            -opt.force_feedback_gain * e.efforts[ta::wire::kNumJoints - 1],
-                            0.2, false);
-                    }
+                        // Gripper (joint 6): Glide uses normalised cubic fit;
+                        // wxai_v0 applies scaled effort directly.
+                        if (glide_leader) {
+                            const double effort_norm =
+                                std::min(std::abs(e.efforts[ta::wire::kNumJoints - 1]) /
+                                             FOLLOWER_GRIPPER_MAX_EFFORT, 1.0);
+                            const double gripper_effort =
+                                LEADER_GRIPPER_MAX_EFFORT * std::pow(effort_norm, 3) +
+                                GRIPPER_EFFORT_OFFSET;
+                            driver->set_gripper_effort(gripper_effort, 0.1, false);
+                        } else {
+                            driver->set_gripper_external_effort(
+                                -opt.force_feedback_gain * e.efforts[ta::wire::kNumJoints - 1],
+                                0.2, false);
+                        }
+                    });
                 }
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "leader: bad effort payload: %s\n", e.what());
@@ -248,25 +266,60 @@ int main(int argc, char** argv) try {
         // get_all_velocities() is two daemon cycles. get_robot_output()
         // returns both (and more) in one cycle, halving the per-tick
         // contention window with the daemon.
-        const auto out = driver->get_robot_output();
-        auto positions  = out.joint.all.positions;
-        auto velocities  = out.joint.all.velocities;
-        for (double& v : velocities) {
-            v = std::clamp(v, -opt.velocity_limit, opt.velocity_limit);
+        maybe_guard([&] {
+            const auto out = driver->get_robot_output();
+            auto positions  = out.joint.all.positions;
+            auto velocities  = out.joint.all.velocities;
+            for (double& v : velocities) {
+                v = std::clamp(v, -opt.velocity_limit, opt.velocity_limit);
+            }
+            if (glide_leader) {
+                positions[3] = -positions[3];
+                positions[4] = -positions[4];
+                positions[5] += (opt.model_str == "glide_left") ? -kDefaultJoint5Offset : kDefaultJoint5Offset;
+                velocities[3] = -velocities[3];
+                velocities[4] = -velocities[4];
+            }
+            const auto payload = ta::wire::encode_state(ta::wire::now_seconds(), positions, velocities);
+            state_latest.put(payload.data(), payload.size());
+        });
+
+        // Glide-only: if the driver just faulted, tell the follower to stop
+        // (home) immediately, then attempt one blocking recovery. Failing to
+        // clear exits the process (via the throws below, through the normal
+        // top-level catch and ArmParkGuard) exactly as an unhandled fault
+        // would have before this existed. A second fault before the operator
+        // ever pressed the start/stop button to resume also exits, rather
+        // than retrying forever against what's likely a persistent problem
+        // (e.g. a loose cable) -- a fault after real teleop resumed is
+        // treated as fresh and retried normally.
+        if (glide_leader && fault_tracker.faulted()) {
+            std::cout << "leader: FAULT, notifying follower to stop and go home\n";
+            const auto fault_payload = ta::wire::encode_ready(ta::wire::now_seconds());
+            leader_fault_pub.put(fault_payload.data(), fault_payload.size());
+
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+
+            if (!fault_tracker.try_clear(*driver)) {
+                throw std::runtime_error("leader: failed to clear fault, giving up");
+            }
+            if (awaiting_start_since_clear) {
+                throw std::runtime_error(
+                    "leader: faulted again before teleop resumed, giving up");
+            }
+            driver->set_all_modes(trossen_arm::Mode::external_effort);
+            if (glide_leader) {
+                driver->set_gripper_mode(trossen_arm::Mode::effort);
+                driver->set_gripper_effort(GRIPPER_EFFORT_OFFSET, 0.2, false);
+            }
+            awaiting_start_since_clear = true;
+            std::cout << "leader: fault cleared, press the start/stop button to resume teleop\n";
         }
-        if (glide_leader) {
-            positions[3] = -positions[3];
-            positions[4] = -positions[4];
-            positions[5] += (opt.model_str == "glide_left") ? -kDefaultJoint5Offset : kDefaultJoint5Offset;
-            velocities[3] = -velocities[3];
-            velocities[4] = -velocities[4];
-        }
-        const auto payload = ta::wire::encode_state(ta::wire::now_seconds(), positions, velocities);
-        state_latest.put(payload.data(), payload.size());
 
         // Glide-only: forward button presses to the follower.
         if (glide_leader) {
             if (teleop_toggle_button.poll(*driver)) {
+                awaiting_start_since_clear = false;
                 std::cout << "leader: start/stop button pressed, notifying follower\n";
                 const auto p = ta::wire::encode_ready(ta::wire::now_seconds());
                 teleop_toggle_pub.put(p.data(), p.size());

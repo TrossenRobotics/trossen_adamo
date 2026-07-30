@@ -345,10 +345,12 @@ int main(int argc, char** argv) try {
     const auto follower_ready_topic = ta::topics::follower_ready_of(opt.robot);
     const auto teleop_toggle_topic  = ta::topics::teleop_toggle_of(opt.robot);
     const auto error_recover_topic  = ta::topics::error_recover_of(opt.robot);
+    const auto leader_fault_topic   = ta::topics::leader_fault_of(opt.robot);
     // Leader state runs on the SDK's receive thread, off the control loop.
     ta::LatestSubscriber state_sub(session, state_topic);
     ta::LatestSubscriber teleop_toggle_sub(session, teleop_toggle_topic);
     ta::LatestSubscriber error_recover_sub(session, error_recover_topic);
+    ta::LatestSubscriber leader_fault_sub(session, leader_fault_topic);
     auto ready_sub = session.subscribe(leader_ready_topic);
 
     std::cout << "follower: moving to home\n";
@@ -391,6 +393,7 @@ int main(int argc, char** argv) try {
     ta::recovery::ArmFaultTracker fault_tracker("follower");
     std::vector<std::uint8_t> teleop_toggle_buf;
     std::vector<std::uint8_t> error_recover_buf;
+    std::vector<std::uint8_t> leader_fault_buf;
 
     // Wraps a driver call: guarded (caught, fault-tracked) when
     // --button-gated, called directly (exceptions propagate as before)
@@ -454,6 +457,20 @@ int main(int argc, char** argv) try {
                             sync_started_at.reset();
                             std::cout << "follower: fault cleared (leader button), resuming teleop\n";
                     }
+                }
+            }
+
+            // Leader self-recovery notification: the leader's own driver
+            // just faulted. Stop and go home immediately rather than keep
+            // tracking a leader that's no longer sending fresh state; a
+            // no-op if already stopped.
+            if (leader_fault_sub.poll(leader_fault_buf)) {
+                double ts = 0.0;
+                if (ta::wire::decode_ready(leader_fault_buf.data(), leader_fault_buf.size(), &ts) &&
+                    ts >= teleop_started_at && state == TeleopState::Active) {
+                    maybe_guard([&] { ta::arm::move_home(*driver); });
+                    state = TeleopState::Stopped;
+                    std::cout << "follower: leader faulted, stopped and moved home\n";
                 }
             }
         }

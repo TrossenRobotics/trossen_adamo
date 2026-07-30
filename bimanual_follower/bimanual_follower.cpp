@@ -506,6 +506,8 @@ int main(int argc, char** argv) try {
     const auto teleop_toggle_right_topic = ta::topics::teleop_toggle_right_of(opt.robot);
     const auto error_recover_left_topic  = ta::topics::error_recover_left_of(opt.robot);
     const auto error_recover_right_topic = ta::topics::error_recover_right_of(opt.robot);
+    const auto leader_fault_left_topic   = ta::topics::leader_fault_left_of(opt.robot);
+    const auto leader_fault_right_topic  = ta::topics::leader_fault_right_of(opt.robot);
 
     // Leader state subscribers run on the SDK's receive thread.
     ta::LatestSubscriber state_left_sub(session,  state_left_topic);
@@ -514,6 +516,8 @@ int main(int argc, char** argv) try {
     ta::LatestSubscriber teleop_toggle_right_sub(session, teleop_toggle_right_topic);
     ta::LatestSubscriber error_recover_left_sub(session,  error_recover_left_topic);
     ta::LatestSubscriber error_recover_right_sub(session, error_recover_right_topic);
+    ta::LatestSubscriber leader_fault_left_sub(session,  leader_fault_left_topic);
+    ta::LatestSubscriber leader_fault_right_sub(session, leader_fault_right_topic);
     auto ready_sub = session.subscribe(leader_ready_topic);
 
     std::cout << "bimanual_follower: moving arms to home\n";
@@ -562,6 +566,7 @@ int main(int argc, char** argv) try {
     TeleopState state_right = opt.button_gated ? TeleopState::Stopped : TeleopState::Active;
     std::vector<std::uint8_t> teleop_toggle_left_buf, teleop_toggle_right_buf;
     std::vector<std::uint8_t> error_recover_left_buf, error_recover_right_buf;
+    std::vector<std::uint8_t> leader_fault_left_buf, leader_fault_right_buf;
 
     // Wraps a driver call: guarded (caught, fault-tracked) when
     // --button-gated, called directly (exceptions propagate as before)
@@ -664,6 +669,29 @@ int main(int argc, char** argv) try {
                         right_ss.sync_started_at.reset();
                         std::cout << "bimanual_follower: right fault cleared (leader button), resuming teleop\n";
                     }
+                }
+            }
+
+            // Leader self-recovery notifications: that side's leader driver
+            // just faulted. Stop and go home immediately rather than keep
+            // tracking a leader that's no longer sending fresh state; a
+            // no-op if that side is already stopped.
+            if (leader_fault_left_sub.poll(leader_fault_left_buf)) {
+                double ts = 0.0;
+                if (ta::wire::decode_ready(leader_fault_left_buf.data(), leader_fault_left_buf.size(), &ts) &&
+                    ts >= teleop_started_at && state_left == TeleopState::Active) {
+                    maybe_guard_left([&] { ta::arm::move_home(*left_driver); });
+                    state_left = TeleopState::Stopped;
+                    std::cout << "bimanual_follower: left leader faulted, stopped and moved home\n";
+                }
+            }
+            if (leader_fault_right_sub.poll(leader_fault_right_buf)) {
+                double ts = 0.0;
+                if (ta::wire::decode_ready(leader_fault_right_buf.data(), leader_fault_right_buf.size(), &ts) &&
+                    ts >= teleop_started_at && state_right == TeleopState::Active) {
+                    maybe_guard_right([&] { ta::arm::move_home(*right_driver); });
+                    state_right = TeleopState::Stopped;
+                    std::cout << "bimanual_follower: right leader faulted, stopped and moved home\n";
                 }
             }
         }
