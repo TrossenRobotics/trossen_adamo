@@ -26,6 +26,12 @@ inline void install_signal_handlers() {
     auto handler = [](int) noexcept { detail::stop_flag_storage.store(true); };
     std::signal(SIGINT,  handler);
     std::signal(SIGTERM, handler);
+
+    // Ignore SIGPIPE: unhandled, a write to a closed socket (e.g. during
+    // clear_error()'s TCP reconnect) kills the whole process instantly with
+    // no exception. Ignoring it turns that into a plain EPIPE error, which
+    // trossen_arm-source already handles as a catchable exception.
+    std::signal(SIGPIPE, SIG_IGN);
 }
 
 inline bool stop_requested() noexcept {
