@@ -75,7 +75,7 @@ struct Options {
     double stall_log_ms        = 50.0;
     bool   clear_error         = false;
 
-    // Glide-only: start paused and wait for a leader button press before
+    // Glide-only: start stopped and wait for a leader button press before
     // tracking (applies to both sides).
     bool button_gated = false;
 
@@ -154,9 +154,9 @@ void usage(const char* prog) {
         "  --clear-error                    clear arm fault on connect\n"
         "  --left-model NAME                wxai_v0|pro (default: wxai_v0)\n"
         "  --right-model NAME               wxai_v0|pro (default: wxai_v0)\n"
-        "  --button-gated                   Glide leaders only: start paused; SEL_1 on each leader\n"
-        "                                   toggles that side's pause/resume, SEL_2 clears a fault\n"
-        "                                   and resumes (applies independently per side)\n"
+        "  --button-gated                   Glide leaders only: start stopped; SEL_1 on each leader\n"
+        "                                   starts/stops that side's teleop (stop moves it home),\n"
+        "                                   SEL_2 clears a fault and resumes (independent per side)\n"
         "\n"
         "Smoothing options:\n"
         "  --smooth-alpha A                 EMA factor in (0,1]; 1.0 disables (default: 0.35)\n"
@@ -531,14 +531,15 @@ int main(int argc, char** argv) try {
     left_ss.next_stats  = make_next_stats();
     right_ss.next_stats = make_next_stats();
 
-    // --button-gated state per side: a Glide leader's SEL_1 toggles that
-    // side's Paused/Active, SEL_2 clears that side's fault and resumes.
-    // When not gated, both sides stay Active the whole run (today's
-    // behaviour, unchanged) and each side's fault tracker is bypassed
-    // entirely so an uncaught driver exception still propagates as before.
-    enum class TeleopState { Paused, Active };
-    TeleopState state_left  = opt.button_gated ? TeleopState::Paused : TeleopState::Active;
-    TeleopState state_right = opt.button_gated ? TeleopState::Paused : TeleopState::Active;
+    // --button-gated state per side: a Glide leader's SEL_1 starts/stops
+    // that side's teleop (stopping moves that arm home), SEL_2 clears that
+    // side's fault and resumes. When not gated, both sides stay Active the
+    // whole run (today's behaviour, unchanged) and each side's fault
+    // tracker is bypassed entirely so an uncaught driver exception still
+    // propagates as before.
+    enum class TeleopState { Stopped, Active };
+    TeleopState state_left  = opt.button_gated ? TeleopState::Stopped : TeleopState::Active;
+    TeleopState state_right = opt.button_gated ? TeleopState::Stopped : TeleopState::Active;
     std::vector<std::uint8_t> teleop_toggle_left_buf, teleop_toggle_right_buf;
     std::vector<std::uint8_t> error_recover_left_buf, error_recover_right_buf;
 
@@ -576,20 +577,21 @@ int main(int argc, char** argv) try {
         });
 
         if (opt.button_gated) {
-            // Left side: SEL_1 toggle pause/resume, SEL_2 error recovery.
+            // Left side: SEL_1 start/stop teleop, SEL_2 error recovery.
             if (teleop_toggle_left_sub.poll(teleop_toggle_left_buf)) {
                 double ts = 0.0;
                 if (ta::wire::decode_ready(teleop_toggle_left_buf.data(), teleop_toggle_left_buf.size(), &ts) &&
                     ts >= teleop_started_at) {
                     if (fault_tracker_left.faulted()) {
-                        std::cout << "bimanual_follower: ignoring left pause/resume — faulted; press the left error-recovery button first\n";
-                    } else if (state_left == TeleopState::Paused) {
+                        std::cout << "bimanual_follower: ignoring left start/stop — faulted; press the left error-recovery button first\n";
+                    } else if (state_left == TeleopState::Stopped) {
                         state_left = TeleopState::Active;
                         left_ss.synced = false;
-                        std::cout << "bimanual_follower: left teleop resumed (leader button)\n";
+                        std::cout << "bimanual_follower: left teleop started (leader button)\n";
                     } else {
-                        state_left = TeleopState::Paused;
-                        std::cout << "bimanual_follower: left teleop paused (leader button)\n";
+                        maybe_guard_left([&] { ta::arm::move_home(*left_driver); });
+                        state_left = TeleopState::Stopped;
+                        std::cout << "bimanual_follower: left teleop stopped (leader button), moved home\n";
                     }
                 }
             }
@@ -608,20 +610,21 @@ int main(int argc, char** argv) try {
                 }
             }
 
-            // Right side: SEL_1 toggle pause/resume, SEL_2 error recovery.
+            // Right side: SEL_1 start/stop teleop, SEL_2 error recovery.
             if (teleop_toggle_right_sub.poll(teleop_toggle_right_buf)) {
                 double ts = 0.0;
                 if (ta::wire::decode_ready(teleop_toggle_right_buf.data(), teleop_toggle_right_buf.size(), &ts) &&
                     ts >= teleop_started_at) {
                     if (fault_tracker_right.faulted()) {
-                        std::cout << "bimanual_follower: ignoring right pause/resume — faulted; press the right error-recovery button first\n";
-                    } else if (state_right == TeleopState::Paused) {
+                        std::cout << "bimanual_follower: ignoring right start/stop — faulted; press the right error-recovery button first\n";
+                    } else if (state_right == TeleopState::Stopped) {
                         state_right = TeleopState::Active;
                         right_ss.synced = false;
-                        std::cout << "bimanual_follower: right teleop resumed (leader button)\n";
+                        std::cout << "bimanual_follower: right teleop started (leader button)\n";
                     } else {
-                        state_right = TeleopState::Paused;
-                        std::cout << "bimanual_follower: right teleop paused (leader button)\n";
+                        maybe_guard_right([&] { ta::arm::move_home(*right_driver); });
+                        state_right = TeleopState::Stopped;
+                        std::cout << "bimanual_follower: right teleop stopped (leader button), moved home\n";
                     }
                 }
             }

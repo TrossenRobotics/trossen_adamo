@@ -264,7 +264,7 @@ int main(int argc, char** argv) try {
     std::vector<double> applied_left(ta::wire::kNumJoints - 1, 0.0);   // joints 0-5
     std::vector<double> applied_right(ta::wire::kNumJoints - 1, 0.0);
 
-    // Glide-only per side: SEL_1 toggles that side's follower pause/resume,
+    // Glide-only per side: SEL_1 starts/stops that side's follower teleop,
     // SEL_2 clears that side's follower fault and resumes. Left glide ->
     // left follower, right glide -> right follower (each side independent).
     ta::recovery::ButtonTrigger left_teleop_toggle_button(/*bit=*/0);   // SEL_1
@@ -370,7 +370,7 @@ int main(int argc, char** argv) try {
         // Glide-only: forward each side's button presses to that side's follower.
         if (left_is_glide) {
             if (left_teleop_toggle_button.poll(*left_driver)) {
-                std::cout << "bimanual_leader: left pause/resume button pressed, notifying follower\n";
+                std::cout << "bimanual_leader: left start/stop button pressed, notifying follower\n";
                 const auto p = ta::wire::encode_ready(ta::wire::now_seconds());
                 teleop_toggle_left_pub.put(p.data(), p.size());
             }
@@ -382,7 +382,7 @@ int main(int argc, char** argv) try {
         }
         if (right_is_glide) {
             if (right_teleop_toggle_button.poll(*right_driver)) {
-                std::cout << "bimanual_leader: right pause/resume button pressed, notifying follower\n";
+                std::cout << "bimanual_leader: right start/stop button pressed, notifying follower\n";
                 const auto p = ta::wire::encode_ready(ta::wire::now_seconds());
                 teleop_toggle_right_pub.put(p.data(), p.size());
             }

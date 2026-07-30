@@ -200,9 +200,9 @@ int main(int argc, char** argv) try {
     std::vector<std::uint8_t> effort_buf;     // reused; capacity stable after warm-up
     std::vector<double> applied(ta::wire::kNumJoints - 1, 0.0);  // joints 0-5
 
-    // Glide-only: SEL_1 toggles the follower's teleop pause/resume, SEL_2
-    // clears a follower fault and resumes. See trossen_adamo/recovery.hpp
-    // and follower/follower.cpp's --button-gated mode.
+    // Glide-only: SEL_1 starts/stops the follower's teleop, SEL_2 clears a
+    // follower fault and resumes. See trossen_adamo/recovery.hpp and
+    // follower/follower.cpp's --button-gated mode.
     ta::recovery::ButtonTrigger teleop_toggle_button(/*bit=*/0);  // SEL_1
     ta::recovery::ButtonTrigger error_recover_button(/*bit=*/1);  // SEL_2
 
@@ -267,7 +267,7 @@ int main(int argc, char** argv) try {
         // Glide-only: forward button presses to the follower.
         if (glide_leader) {
             if (teleop_toggle_button.poll(*driver)) {
-                std::cout << "leader: pause/resume button pressed, notifying follower\n";
+                std::cout << "leader: start/stop button pressed, notifying follower\n";
                 const auto p = ta::wire::encode_ready(ta::wire::now_seconds());
                 teleop_toggle_pub.put(p.data(), p.size());
             }

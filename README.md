@@ -48,8 +48,8 @@ Pass `--button-gated` to `trossen_follower` to control teleop from the Glide
 leader's buttons instead of starting automatically (default off — without the
 flag, nothing here changes):
 
-- **SEL_1**: toggle pause/resume. Resuming ramps to the leader's current pose
-  instead of snapping.
+- **SEL_1**: start/stop teleop. Stopping moves the follower to its home pose;
+  starting ramps to the leader's current pose instead of snapping.
 - **SEL_2**: if the follower has faulted (e.g. a joint/velocity limit), clears
   the error and resumes — no restart needed.
 

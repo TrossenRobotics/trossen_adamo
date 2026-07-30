@@ -58,7 +58,7 @@ struct Options {
     double stall_log_ms = 50.0;
     bool clear_error = false;
 
-    // Glide-only: start paused and wait for a leader button press before
+    // Glide-only: start stopped and wait for a leader button press before
     // tracking.
     bool button_gated = false;
 
@@ -131,8 +131,9 @@ void usage(const char* prog) {
         "  --stall-log-ms MS           (default: 50)\n"
         "  --clear-error               clear arm fault on connect\n"
         "  --model NAME                wxai_v0|pro (default: wxai_v0)\n"
-        "  --button-gated              Glide leader only: start paused; SEL_1 on the leader\n"
-        "                               toggles pause/resume, SEL_2 clears a fault and resumes\n"
+        "  --button-gated              Glide leader only: start stopped; SEL_1 on the leader\n"
+        "                               starts/stops teleop (stop moves the follower home),\n"
+        "                               SEL_2 clears a fault and resumes\n"
         "\n"
         "Smoothing options (applied to commanded follower positions):\n"
         "  --smooth-alpha A            EMA factor in (0,1]; 1.0 disables (default: 0.35)\n"
@@ -258,7 +259,7 @@ int main(int argc, char** argv) try {
                                      opt.connect_timeout,
                                      model_cfg.model);
 
-    // Widen the arm joints' velocity/effort fault tolerance to their max
+    // Widen the arm joints' velocity/effort fault tolerance to their max.
     {
         auto joint_limits = driver->get_joint_limits();
         for (int i = 0; i < 6; ++i) {
@@ -381,10 +382,10 @@ int main(int argc, char** argv) try {
                          std::chrono::duration<double>(opt.stats_interval_s));
     }
 
-    // --button-gated state: a Glide leader's SEL_1 toggles Paused/Active,
-    // SEL_2 clears a fault and resumes.
-    enum class TeleopState { Paused, Active };
-    TeleopState state = opt.button_gated ? TeleopState::Paused : TeleopState::Active;
+    // --button-gated state: a Glide leader's SEL_1 starts/stops teleop
+    // (stopping moves the follower home), SEL_2 clears a fault and resumes.
+    enum class TeleopState { Stopped, Active };
+    TeleopState state = opt.button_gated ? TeleopState::Stopped : TeleopState::Active;
     ta::recovery::ArmFaultTracker fault_tracker("follower");
     std::vector<std::uint8_t> teleop_toggle_buf;
     std::vector<std::uint8_t> error_recover_buf;
@@ -414,22 +415,24 @@ int main(int argc, char** argv) try {
         });
 
         if (opt.button_gated) {
-            // SEL_1: toggle pause/resume. Ignored while faulted — clear the
-            // fault first (SEL_2). Resuming always ramps back to the
-            // leader's current pose rather than snapping.
+            // SEL_1: start/stop teleop. Ignored while faulted — clear the
+            // fault first (SEL_2). Stopping moves the follower home;
+            // starting always ramps back to the leader's current pose
+            // rather than snapping.
             if (teleop_toggle_sub.poll(teleop_toggle_buf)) {
                 double ts = 0.0;
                 if (ta::wire::decode_ready(teleop_toggle_buf.data(), teleop_toggle_buf.size(), &ts) &&
                     ts >= teleop_started_at) {
                     if (fault_tracker.faulted()) {
-                        std::cout << "follower: ignoring pause/resume — faulted; press the error-recovery button first\n";
-                    } else if (state == TeleopState::Paused) {
+                        std::cout << "follower: ignoring start/stop — faulted; press the error-recovery button first\n";
+                    } else if (state == TeleopState::Stopped) {
                         state = TeleopState::Active;
                         synced = false;
-                        std::cout << "follower: teleop resumed (leader button)\n";
+                        std::cout << "follower: teleop started (leader button)\n";
                     } else {
-                        state = TeleopState::Paused;
-                        std::cout << "follower: teleop paused (leader button)\n";
+                        maybe_guard([&] { ta::arm::move_home(*driver); });
+                        state = TeleopState::Stopped;
+                        std::cout << "follower: teleop stopped (leader button), moved home\n";
                     }
                 }
             }
@@ -443,9 +446,9 @@ int main(int argc, char** argv) try {
                         std::cout << "follower: error-recovery button pressed but there is no active fault\n";
                     } else if (fault_tracker.try_clear(*driver)) {
                         driver->set_all_modes(trossen_arm::Mode::position);
-                        state = TeleopState::Active;
-                        synced = false;
-                        std::cout << "follower: fault cleared (leader button), resuming teleop\n";
+                            state = TeleopState::Active;
+                            synced = false;
+                            std::cout << "follower: fault cleared (leader button), resuming teleop\n";
                     }
                 }
             }
