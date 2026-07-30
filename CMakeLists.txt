@@ -19,7 +19,7 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake")
 option(ADAMO_TROSSEN_BUILD_LEADER   "Build the trossen_leader binary"   ON)
 option(ADAMO_TROSSEN_BUILD_FOLLOWER "Build the trossen_follower binary" ON)
 option(ADAMO_TROSSEN_BUILD_VR_HEADSET "Build the vr_headset binary" ON)
-option(ADAMO_TROSSEN_BUILD_VR_FOLLOWE   R "Build the vr_follower binary" ON)
+option(ADAMO_TROSSEN_BUILD_VR_FOLLOWER "Build the vr_follower binary" ON)
 option(ADAMO_TROSSEN_BUILD_BIMANUAL_LEADER   "Build the bimanual_leader binary"   ON)
 option(ADAMO_TROSSEN_BUILD_BIMANUAL_FOLLOWER "Build the bimanual_follower binary" ON)
 

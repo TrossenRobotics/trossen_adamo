@@ -11,6 +11,7 @@
 #include "trossen_adamo/handshake.hpp"
 #include "trossen_adamo/loop.hpp"
 #include "trossen_adamo/publisher.hpp"
+#include "trossen_adamo/recovery.hpp"
 #include "trossen_adamo/signal.hpp"
 #include "trossen_adamo/subscriber.hpp"
 #include "trossen_adamo/topics.hpp"
@@ -33,9 +34,9 @@ constexpr const char* kDefaultRobot     = "wxai";
 constexpr const char* kDefaultLeaderIp  = "192.168.1.2";
 
 // Gripper force-feedback constants.
-constexpr double LEADER_GRIPPER_MAX_EFFORT   = 27.0;
-constexpr double FOLLOWER_GRIPPER_MAX_EFFORT = 87.5;
-constexpr double GRIPPER_EFFORT_OFFSET       = 8.0;
+constexpr double LEADER_GRIPPER_MAX_EFFORT   = 20.0;
+constexpr double FOLLOWER_GRIPPER_MAX_EFFORT = 100.0;
+constexpr double GRIPPER_EFFORT_OFFSET       = 6.5;
 constexpr double kDefaultJoint5Offset        = M_PI / 4.0;
 
 struct Options {
@@ -136,6 +137,20 @@ int main(int argc, char** argv) try {
                                      opt.connect_timeout,
                                      parse_model(opt.model_str));
 
+    const bool glide_leader = is_glide(opt.model_str);
+
+    // Cap the gripper's max opening and widen the arm joints' velocity/effort
+    // fault tolerance to their max.
+    {
+        auto joint_limits = driver->get_joint_limits();
+        joint_limits.back().position_max = 0.05;
+        for (int i = 0; i < 6; ++i) {
+            joint_limits[i].velocity_tolerance = joint_limits[i].velocity_max;
+            joint_limits[i].effort_tolerance = joint_limits[i].effort_max;
+        }
+        driver->set_joint_limits(joint_limits);
+    }
+
     // From here on, any thrown exception (including handshake timeout,
     // driver fault, or external_effort-mode operation failures) must run
     // through safe_park before unwinding past main: the leader spends most
@@ -149,9 +164,13 @@ int main(int argc, char** argv) try {
     const auto effort_topic        = ta::topics::effort_of(opt.robot);
     const auto leader_ready_topic  = ta::topics::leader_ready_of(opt.robot);
     const auto follower_ready_topic= ta::topics::follower_ready_of(opt.robot);
+    const auto teleop_toggle_topic = ta::topics::teleop_toggle_of(opt.robot);
+    const auto error_recover_topic = ta::topics::error_recover_of(opt.robot);
     // Effort feedback runs on the SDK's receive thread, off the control loop.
     ta::LatestSubscriber effort_sub(session, effort_topic);
     auto ready_sub = session.subscribe(follower_ready_topic);
+    auto teleop_toggle_pub = session.publisher(teleop_toggle_topic, 250, true, false);
+    auto error_recover_pub = session.publisher(error_recover_topic, 250, true, false);
 
     std::cout << "leader: moving to home\n";
     ta::arm::move_home(*driver);
@@ -168,13 +187,24 @@ int main(int argc, char** argv) try {
     std::this_thread::sleep_for(std::chrono::seconds(1));
     driver->set_all_modes(trossen_arm::Mode::external_effort);
 
-    const bool glide_leader = is_glide(opt.model_str);
+    // Glide's gripper (finger) is force-controlled via effort mode
+    if (glide_leader) {
+        driver->set_gripper_mode(trossen_arm::Mode::effort);
+        driver->set_gripper_effort(GRIPPER_EFFORT_OFFSET, 0.2, false);
+    }
+
     const double teleop_started_at = ta::wire::now_seconds();
     const auto loop_end = std::chrono::steady_clock::now() +
                           std::chrono::duration<double>(opt.teleoperation_time);
 
     std::vector<std::uint8_t> effort_buf;     // reused; capacity stable after warm-up
     std::vector<double> applied(ta::wire::kNumJoints - 1, 0.0);  // joints 0-5
+
+    // Glide-only: SEL_1 toggles the follower's teleop pause/resume, SEL_2
+    // clears a follower fault and resumes. See trossen_adamo/recovery.hpp
+    // and follower/follower.cpp's --button-gated mode.
+    ta::recovery::ButtonTrigger teleop_toggle_button(/*bit=*/0);  // SEL_1
+    ta::recovery::ButtonTrigger error_recover_button(/*bit=*/1);  // SEL_2
 
     while (!ta::stop_requested() && std::chrono::steady_clock::now() < loop_end) {
         const auto loop_start = std::chrono::steady_clock::now();
@@ -200,7 +230,7 @@ int main(int argc, char** argv) try {
                         const double gripper_effort =
                             LEADER_GRIPPER_MAX_EFFORT * std::pow(effort_norm, 3) +
                             GRIPPER_EFFORT_OFFSET;
-                        driver->set_gripper_external_effort(gripper_effort, 0.2, false);
+                        driver->set_gripper_effort(gripper_effort, 0.1, false);
                     } else {
                         driver->set_gripper_external_effort(
                             -opt.force_feedback_gain * e.efforts[ta::wire::kNumJoints - 1],
@@ -233,6 +263,20 @@ int main(int argc, char** argv) try {
         }
         const auto payload = ta::wire::encode_state(ta::wire::now_seconds(), positions, velocities);
         state_latest.put(payload.data(), payload.size());
+
+        // Glide-only: forward button presses to the follower.
+        if (glide_leader) {
+            if (teleop_toggle_button.poll(*driver)) {
+                std::cout << "leader: pause/resume button pressed, notifying follower\n";
+                const auto p = ta::wire::encode_ready(ta::wire::now_seconds());
+                teleop_toggle_pub.put(p.data(), p.size());
+            }
+            if (error_recover_button.poll(*driver)) {
+                std::cout << "leader: error-recovery button pressed, notifying follower\n";
+                const auto p = ta::wire::encode_ready(ta::wire::now_seconds());
+                error_recover_pub.put(p.data(), p.size());
+            }
+        }
 
         const auto elapsed_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - loop_start).count();

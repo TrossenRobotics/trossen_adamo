@@ -20,6 +20,7 @@
 #include "trossen_adamo/handshake.hpp"
 #include "trossen_adamo/loop.hpp"
 #include "trossen_adamo/publisher.hpp"
+#include "trossen_adamo/recovery.hpp"
 #include "trossen_adamo/signal.hpp"
 #include "trossen_adamo/subscriber.hpp"
 #include "trossen_adamo/topics.hpp"
@@ -43,9 +44,9 @@ constexpr const char* kDefaultLeftLeaderIp   = "192.168.1.4";
 constexpr const char* kDefaultRightLeaderIp  = "192.168.1.2";
 
 // Gripper force-feedback constants.
-constexpr double LEADER_GRIPPER_MAX_EFFORT   = 27.0;
-constexpr double FOLLOWER_GRIPPER_MAX_EFFORT = 87.5;
-constexpr double GRIPPER_EFFORT_OFFSET       = 8.0;
+constexpr double LEADER_GRIPPER_MAX_EFFORT   = 20.0;
+constexpr double FOLLOWER_GRIPPER_MAX_EFFORT = 100.0;
+constexpr double GRIPPER_EFFORT_OFFSET       = 6.5;
 constexpr double kDefaultJoint5Offset        = M_PI / 4.0;
 
 struct Options {
@@ -175,11 +176,24 @@ int main(int argc, char** argv) try {
                                            opt.connect_timeout,
                                            parse_model(opt.right_model_str));
 
+    const bool left_is_glide  = is_glide(opt.left_model_str);
+    const bool right_is_glide = is_glide(opt.right_model_str);
+
+    // Cap the gripper's max opening and widen the arm joints' velocity/effort
+    // fault tolerance to their max.
     auto left_joint_limits = left_driver->get_joint_limits();
     left_joint_limits.back().position_max = 0.05;
+    for (int i = 0; i < 6; ++i) {
+        left_joint_limits[i].velocity_tolerance = left_joint_limits[i].velocity_max;
+        left_joint_limits[i].effort_tolerance = left_joint_limits[i].effort_max;
+    }
     left_driver->set_joint_limits(left_joint_limits);
     auto right_joint_limits = right_driver->get_joint_limits();
     right_joint_limits.back().position_max = 0.05;
+    for (int i = 0; i < 6; ++i) {
+        right_joint_limits[i].velocity_tolerance = right_joint_limits[i].velocity_max;
+        right_joint_limits[i].effort_tolerance = right_joint_limits[i].effort_max;
+    }
     right_driver->set_joint_limits(right_joint_limits);
 
     std::cout << "bimanual_leader: joint limits set, teleop running for " << opt.teleoperation_time << " seconds\n";
@@ -200,11 +214,19 @@ int main(int argc, char** argv) try {
     const auto effort_right_topic    = ta::topics::effort_right_of(opt.robot);
     const auto leader_ready_topic    = ta::topics::leader_ready_of(opt.robot);
     const auto follower_ready_topic  = ta::topics::follower_ready_of(opt.robot);
+    const auto teleop_toggle_left_topic  = ta::topics::teleop_toggle_left_of(opt.robot);
+    const auto teleop_toggle_right_topic = ta::topics::teleop_toggle_right_of(opt.robot);
+    const auto error_recover_left_topic  = ta::topics::error_recover_left_of(opt.robot);
+    const auto error_recover_right_topic = ta::topics::error_recover_right_of(opt.robot);
 
     // Effort feedback runs on the SDK's receive thread, off the control loop.
     ta::LatestSubscriber effort_left_sub(session,  effort_left_topic);
     ta::LatestSubscriber effort_right_sub(session, effort_right_topic);
     auto ready_sub = session.subscribe(follower_ready_topic);
+    auto teleop_toggle_left_pub  = session.publisher(teleop_toggle_left_topic,  250, true, false);
+    auto teleop_toggle_right_pub = session.publisher(teleop_toggle_right_topic, 250, true, false);
+    auto error_recover_left_pub  = session.publisher(error_recover_left_topic,  250, true, false);
+    auto error_recover_right_pub = session.publisher(error_recover_right_topic, 250, true, false);
 
     std::cout << "bimanual_leader: moving arms to home\n";
     ta::arm::move_home(*left_driver);
@@ -223,8 +245,16 @@ int main(int argc, char** argv) try {
     left_driver->set_all_modes(trossen_arm::Mode::external_effort);
     right_driver->set_all_modes(trossen_arm::Mode::external_effort);
 
-    const bool left_is_glide  = is_glide(opt.left_model_str);
-    const bool right_is_glide = is_glide(opt.right_model_str);
+    // Glide's gripper (finger) is force-controlled via effort mode
+    if (left_is_glide) {
+        left_driver->set_gripper_mode(trossen_arm::Mode::effort);
+        left_driver->set_gripper_effort(GRIPPER_EFFORT_OFFSET, 0.2, false);
+    }
+    if (right_is_glide) {
+        right_driver->set_gripper_mode(trossen_arm::Mode::effort);
+        right_driver->set_gripper_effort(GRIPPER_EFFORT_OFFSET, 0.2, false);
+    }
+
     const double teleop_started_at = ta::wire::now_seconds();
     const auto loop_end = std::chrono::steady_clock::now() +
                           std::chrono::duration<double>(opt.teleoperation_time);
@@ -233,6 +263,14 @@ int main(int argc, char** argv) try {
     std::vector<std::uint8_t> effort_right_buf;
     std::vector<double> applied_left(ta::wire::kNumJoints - 1, 0.0);   // joints 0-5
     std::vector<double> applied_right(ta::wire::kNumJoints - 1, 0.0);
+
+    // Glide-only per side: SEL_1 toggles that side's follower pause/resume,
+    // SEL_2 clears that side's follower fault and resumes. Left glide ->
+    // left follower, right glide -> right follower (each side independent).
+    ta::recovery::ButtonTrigger left_teleop_toggle_button(/*bit=*/0);   // SEL_1
+    ta::recovery::ButtonTrigger left_error_recover_button(/*bit=*/1);   // SEL_2
+    ta::recovery::ButtonTrigger right_teleop_toggle_button(/*bit=*/0);  // SEL_1
+    ta::recovery::ButtonTrigger right_error_recover_button(/*bit=*/1);  // SEL_2
 
     while (!ta::stop_requested() && std::chrono::steady_clock::now() < loop_end) {
         const auto loop_start = std::chrono::steady_clock::now();
@@ -256,7 +294,7 @@ int main(int argc, char** argv) try {
                         const double gripper_effort =
                             LEADER_GRIPPER_MAX_EFFORT * std::pow(effort_norm, 3) +
                             GRIPPER_EFFORT_OFFSET;
-                        left_driver->set_gripper_external_effort(gripper_effort, 0.2, false);
+                        left_driver->set_gripper_effort(gripper_effort, 0.1, false);
                     } else {
                         left_driver->set_gripper_external_effort(
                             -opt.force_feedback_gain * e.efforts[ta::wire::kNumJoints - 1],
@@ -287,7 +325,7 @@ int main(int argc, char** argv) try {
                         const double gripper_effort =
                             LEADER_GRIPPER_MAX_EFFORT * std::pow(effort_norm, 3) +
                             GRIPPER_EFFORT_OFFSET;
-                        right_driver->set_gripper_external_effort(gripper_effort, 0.2, false);
+                        right_driver->set_gripper_effort(gripper_effort, 0.1, false);
                     } else {
                         right_driver->set_gripper_external_effort(
                             -opt.force_feedback_gain * e.efforts[ta::wire::kNumJoints - 1],
@@ -327,6 +365,32 @@ int main(int argc, char** argv) try {
             }
             const auto payload = ta::wire::encode_state(ta::wire::now_seconds(), positions, velocities);
             state_right_latest.put(payload.data(), payload.size());
+        }
+
+        // Glide-only: forward each side's button presses to that side's follower.
+        if (left_is_glide) {
+            if (left_teleop_toggle_button.poll(*left_driver)) {
+                std::cout << "bimanual_leader: left pause/resume button pressed, notifying follower\n";
+                const auto p = ta::wire::encode_ready(ta::wire::now_seconds());
+                teleop_toggle_left_pub.put(p.data(), p.size());
+            }
+            if (left_error_recover_button.poll(*left_driver)) {
+                std::cout << "bimanual_leader: left error-recovery button pressed, notifying follower\n";
+                const auto p = ta::wire::encode_ready(ta::wire::now_seconds());
+                error_recover_left_pub.put(p.data(), p.size());
+            }
+        }
+        if (right_is_glide) {
+            if (right_teleop_toggle_button.poll(*right_driver)) {
+                std::cout << "bimanual_leader: right pause/resume button pressed, notifying follower\n";
+                const auto p = ta::wire::encode_ready(ta::wire::now_seconds());
+                teleop_toggle_right_pub.put(p.data(), p.size());
+            }
+            if (right_error_recover_button.poll(*right_driver)) {
+                std::cout << "bimanual_leader: right error-recovery button pressed, notifying follower\n";
+                const auto p = ta::wire::encode_ready(ta::wire::now_seconds());
+                error_recover_right_pub.put(p.data(), p.size());
+            }
         }
 
         const auto elapsed_ms = std::chrono::duration<double, std::milli>(

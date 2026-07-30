@@ -16,7 +16,7 @@ namespace trossen_adamo::arm {
 
 // Home pose
 inline std::vector<double> home_pose() {
-    return {0.0, M_PI/3, M_PI/6, M_PI/5, 0.0, 0.0, 0.0};
+    return {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
 }
 
 inline std::unique_ptr<trossen_arm::TrossenArmDriver>

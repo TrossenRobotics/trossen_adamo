@@ -23,6 +23,7 @@
 #include "trossen_adamo/handshake.hpp"
 #include "trossen_adamo/loop.hpp"
 #include "trossen_adamo/publisher.hpp"
+#include "trossen_adamo/recovery.hpp"
 #include "trossen_adamo/signal.hpp"
 #include "trossen_adamo/subscriber.hpp"
 #include "trossen_adamo/topics.hpp"
@@ -47,6 +48,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -72,6 +74,10 @@ struct Options {
     double rate_hz             = 100.0;
     double stall_log_ms        = 50.0;
     bool   clear_error         = false;
+
+    // Glide-only: start paused and wait for a leader button press before
+    // tracking (applies to both sides).
+    bool button_gated = false;
 
     // Smoothing / control-shaping parameters.
     double smooth_alpha      = 0.35;
@@ -148,6 +154,9 @@ void usage(const char* prog) {
         "  --clear-error                    clear arm fault on connect\n"
         "  --left-model NAME                wxai_v0|pro (default: wxai_v0)\n"
         "  --right-model NAME               wxai_v0|pro (default: wxai_v0)\n"
+        "  --button-gated                   Glide leaders only: start paused; SEL_1 on each leader\n"
+        "                                   toggles that side's pause/resume, SEL_2 clears a fault\n"
+        "                                   and resumes (applies independently per side)\n"
         "\n"
         "Smoothing options:\n"
         "  --smooth-alpha A                 EMA factor in (0,1]; 1.0 disables (default: 0.35)\n"
@@ -202,6 +211,7 @@ Options parse(int argc, char** argv) {
         else if (a == "--ready-timeout")       o.ready_timeout = ta::parse_double(ta::require_value(a, argc, argv, i), a);
         else if (a == "--stall-log-ms")        o.stall_log_ms = ta::parse_double(ta::require_value(a, argc, argv, i), a);
         else if (a == "--clear-error")         o.clear_error = true;
+        else if (a == "--button-gated")        o.button_gated = true;
         else if (a == "--smooth-alpha")        o.smooth_alpha = ta::parse_double(ta::require_value(a, argc, argv, i), a);
         else if (a == "--max-step")            o.max_step = ta::parse_double(ta::require_value(a, argc, argv, i), a);
         else if (a == "--initial-sync-time")   o.initial_sync_time = ta::parse_double(ta::require_value(a, argc, argv, i), a);
@@ -369,6 +379,28 @@ int main(int argc, char** argv) try {
                                            opt.connect_timeout,
                                            right_model_cfg.model);
 
+    // Widen the arm joints' velocity/effort fault tolerance to their max.
+    {
+        auto left_joint_limits = left_driver->get_joint_limits();
+        for (int i = 0; i < 6; ++i) {
+            left_joint_limits[i].velocity_tolerance = left_joint_limits[i].velocity_max;
+            left_joint_limits[i].effort_tolerance = left_joint_limits[i].effort_max;
+        }
+        left_driver->set_joint_limits(left_joint_limits);
+
+        auto right_joint_limits = right_driver->get_joint_limits();
+        for (int i = 0; i < 6; ++i) {
+            right_joint_limits[i].velocity_tolerance = right_joint_limits[i].velocity_max;
+            right_joint_limits[i].effort_tolerance = right_joint_limits[i].effort_max;
+        }
+        right_driver->set_joint_limits(right_joint_limits);
+    }
+
+    // Guards each side's driver calls against ErrorState faults
+    // independently, so a fault on one side never affects the other.
+    ta::recovery::ArmFaultTracker fault_tracker_left("bimanual_follower_left");
+    ta::recovery::ArmFaultTracker fault_tracker_right("bimanual_follower_right");
+
     // Park guards: fire on every exit path from here on.
     ta::arm::ArmParkGuard left_park(*left_driver,   "bimanual_follower_left");
     ta::arm::ArmParkGuard right_park(*right_driver, "bimanual_follower_right");
@@ -450,10 +482,18 @@ int main(int argc, char** argv) try {
     const auto effort_right_topic    = ta::topics::effort_right_of(opt.robot);
     const auto leader_ready_topic    = ta::topics::leader_ready_of(opt.robot);
     const auto follower_ready_topic  = ta::topics::follower_ready_of(opt.robot);
+    const auto teleop_toggle_left_topic  = ta::topics::teleop_toggle_left_of(opt.robot);
+    const auto teleop_toggle_right_topic = ta::topics::teleop_toggle_right_of(opt.robot);
+    const auto error_recover_left_topic  = ta::topics::error_recover_left_of(opt.robot);
+    const auto error_recover_right_topic = ta::topics::error_recover_right_of(opt.robot);
 
     // Leader state subscribers run on the SDK's receive thread.
     ta::LatestSubscriber state_left_sub(session,  state_left_topic);
     ta::LatestSubscriber state_right_sub(session, state_right_topic);
+    ta::LatestSubscriber teleop_toggle_left_sub(session,  teleop_toggle_left_topic);
+    ta::LatestSubscriber teleop_toggle_right_sub(session, teleop_toggle_right_topic);
+    ta::LatestSubscriber error_recover_left_sub(session,  error_recover_left_topic);
+    ta::LatestSubscriber error_recover_right_sub(session, error_recover_right_topic);
     auto ready_sub = session.subscribe(leader_ready_topic);
 
     std::cout << "bimanual_follower: moving arms to home\n";
@@ -491,38 +531,137 @@ int main(int argc, char** argv) try {
     left_ss.next_stats  = make_next_stats();
     right_ss.next_stats = make_next_stats();
 
+    // --button-gated state per side: a Glide leader's SEL_1 toggles that
+    // side's Paused/Active, SEL_2 clears that side's fault and resumes.
+    // When not gated, both sides stay Active the whole run (today's
+    // behaviour, unchanged) and each side's fault tracker is bypassed
+    // entirely so an uncaught driver exception still propagates as before.
+    enum class TeleopState { Paused, Active };
+    TeleopState state_left  = opt.button_gated ? TeleopState::Paused : TeleopState::Active;
+    TeleopState state_right = opt.button_gated ? TeleopState::Paused : TeleopState::Active;
+    std::vector<std::uint8_t> teleop_toggle_left_buf, teleop_toggle_right_buf;
+    std::vector<std::uint8_t> error_recover_left_buf, error_recover_right_buf;
+
+    // Wraps a driver call: guarded (caught, fault-tracked) when
+    // --button-gated, called directly (exceptions propagate as before)
+    // otherwise. One per side since each has its own fault tracker.
+    auto maybe_guard_left = [&](auto&& fn) {
+        if (opt.button_gated) return fault_tracker_left.guard(std::forward<decltype(fn)>(fn));
+        fn();
+        return true;
+    };
+    auto maybe_guard_right = [&](auto&& fn) {
+        if (opt.button_gated) return fault_tracker_right.guard(std::forward<decltype(fn)>(fn));
+        fn();
+        return true;
+    };
+
+    if (opt.button_gated) {
+        std::cout << "bimanual_follower: --button-gated: waiting for each leader's SEL_1 button to start teleop\n";
+    }
+
     while (!ta::stop_requested() && std::chrono::steady_clock::now() < loop_end) {
         const auto loop_start = std::chrono::steady_clock::now();
 
-        // Publish latest efforts for both arms.
-        {
-            const auto efforts   = left_driver->get_all_external_efforts();
-            const auto payload   = ta::wire::encode_efforts(ta::wire::now_seconds(), efforts);
+        // Publish latest efforts for both arms; guarded only in --button-gated mode.
+        maybe_guard_left([&] {
+            const auto efforts = left_driver->get_all_external_efforts();
+            const auto payload = ta::wire::encode_efforts(ta::wire::now_seconds(), efforts);
             effort_left_latest.put(payload.data(), payload.size());
-        }
-        {
-            const auto efforts   = right_driver->get_all_external_efforts();
-            const auto payload   = ta::wire::encode_efforts(ta::wire::now_seconds(), efforts);
+        });
+        maybe_guard_right([&] {
+            const auto efforts = right_driver->get_all_external_efforts();
+            const auto payload = ta::wire::encode_efforts(ta::wire::now_seconds(), efforts);
             effort_right_latest.put(payload.data(), payload.size());
+        });
+
+        if (opt.button_gated) {
+            // Left side: SEL_1 toggle pause/resume, SEL_2 error recovery.
+            if (teleop_toggle_left_sub.poll(teleop_toggle_left_buf)) {
+                double ts = 0.0;
+                if (ta::wire::decode_ready(teleop_toggle_left_buf.data(), teleop_toggle_left_buf.size(), &ts) &&
+                    ts >= teleop_started_at) {
+                    if (fault_tracker_left.faulted()) {
+                        std::cout << "bimanual_follower: ignoring left pause/resume — faulted; press the left error-recovery button first\n";
+                    } else if (state_left == TeleopState::Paused) {
+                        state_left = TeleopState::Active;
+                        left_ss.synced = false;
+                        std::cout << "bimanual_follower: left teleop resumed (leader button)\n";
+                    } else {
+                        state_left = TeleopState::Paused;
+                        std::cout << "bimanual_follower: left teleop paused (leader button)\n";
+                    }
+                }
+            }
+            if (error_recover_left_sub.poll(error_recover_left_buf)) {
+                double ts = 0.0;
+                if (ta::wire::decode_ready(error_recover_left_buf.data(), error_recover_left_buf.size(), &ts) &&
+                    ts >= teleop_started_at) {
+                    if (!fault_tracker_left.faulted()) {
+                        std::cout << "bimanual_follower: left error-recovery button pressed but there is no active fault\n";
+                    } else if (fault_tracker_left.try_clear(*left_driver)) {
+                        left_driver->set_all_modes(trossen_arm::Mode::position);
+                        state_left = TeleopState::Active;
+                        left_ss.synced = false;
+                        std::cout << "bimanual_follower: left fault cleared (leader button), resuming teleop\n";
+                    }
+                }
+            }
+
+            // Right side: SEL_1 toggle pause/resume, SEL_2 error recovery.
+            if (teleop_toggle_right_sub.poll(teleop_toggle_right_buf)) {
+                double ts = 0.0;
+                if (ta::wire::decode_ready(teleop_toggle_right_buf.data(), teleop_toggle_right_buf.size(), &ts) &&
+                    ts >= teleop_started_at) {
+                    if (fault_tracker_right.faulted()) {
+                        std::cout << "bimanual_follower: ignoring right pause/resume — faulted; press the right error-recovery button first\n";
+                    } else if (state_right == TeleopState::Paused) {
+                        state_right = TeleopState::Active;
+                        right_ss.synced = false;
+                        std::cout << "bimanual_follower: right teleop resumed (leader button)\n";
+                    } else {
+                        state_right = TeleopState::Paused;
+                        std::cout << "bimanual_follower: right teleop paused (leader button)\n";
+                    }
+                }
+            }
+            if (error_recover_right_sub.poll(error_recover_right_buf)) {
+                double ts = 0.0;
+                if (ta::wire::decode_ready(error_recover_right_buf.data(), error_recover_right_buf.size(), &ts) &&
+                    ts >= teleop_started_at) {
+                    if (!fault_tracker_right.faulted()) {
+                        std::cout << "bimanual_follower: right error-recovery button pressed but there is no active fault\n";
+                    } else if (fault_tracker_right.try_clear(*right_driver)) {
+                        right_driver->set_all_modes(trossen_arm::Mode::position);
+                        state_right = TeleopState::Active;
+                        right_ss.synced = false;
+                        std::cout << "bimanual_follower: right fault cleared (leader button), resuming teleop\n";
+                    }
+                }
+            }
         }
 
         // Process left arm state.
-        if (state_left_sub.poll(state_left_buf)) {
+        if (state_left == TeleopState::Active && state_left_sub.poll(state_left_buf)) {
             try {
                 const auto s = ta::wire::decode_state(state_left_buf.data(), state_left_buf.size());
-                process_arm_state(s, teleop_started_at, *left_driver, opt, left_ss,
-                                  "bimanual_follower_left");
+                maybe_guard_left([&] {
+                    process_arm_state(s, teleop_started_at, *left_driver, opt, left_ss,
+                                      "bimanual_follower_left");
+                });
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "bimanual_follower: bad left state payload: %s\n", e.what());
             }
         }
 
         // Process right arm state.
-        if (state_right_sub.poll(state_right_buf)) {
+        if (state_right == TeleopState::Active && state_right_sub.poll(state_right_buf)) {
             try {
                 const auto s = ta::wire::decode_state(state_right_buf.data(), state_right_buf.size());
-                process_arm_state(s, teleop_started_at, *right_driver, opt, right_ss,
-                                  "bimanual_follower_right");
+                maybe_guard_right([&] {
+                    process_arm_state(s, teleop_started_at, *right_driver, opt, right_ss,
+                                      "bimanual_follower_right");
+                });
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "bimanual_follower: bad right state payload: %s\n", e.what());
             }

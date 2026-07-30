@@ -42,6 +42,19 @@ normalised cubic fit; wxai_v0 applies the scaled effort directly.
 `trossen_follower` accepts `--model wxai_v0|pro` (default `wxai_v0`) to select
 the correct end-effector configuration for wxai_v0 or Pro follower arms.
 
+#### Button-gated teleop (Glide leader only, single-arm)
+
+Pass `--button-gated` to `trossen_follower` to control teleop from the Glide
+leader's buttons instead of starting automatically (default off — without the
+flag, nothing here changes):
+
+- **SEL_1**: toggle pause/resume. Resuming ramps to the leader's current pose
+  instead of snapping.
+- **SEL_2**: if the follower has faulted (e.g. a joint/velocity limit), clears
+  the error and resumes — no restart needed.
+
+Requires a Glide leader (only Glide has buttons).
+
 ### Bimanual Teleop
 
 Two binaries on two hosts, each driving **two** arms (right + left) — the

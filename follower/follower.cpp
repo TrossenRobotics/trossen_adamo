@@ -12,6 +12,7 @@
 #include "trossen_adamo/handshake.hpp"
 #include "trossen_adamo/loop.hpp"
 #include "trossen_adamo/publisher.hpp"
+#include "trossen_adamo/recovery.hpp"
 #include "trossen_adamo/signal.hpp"
 #include "trossen_adamo/subscriber.hpp"
 #include "trossen_adamo/topics.hpp"
@@ -35,6 +36,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -55,6 +57,10 @@ struct Options {
     double rate_hz = 100.0;
     double stall_log_ms = 50.0;
     bool clear_error = false;
+
+    // Glide-only: start paused and wait for a leader button press before
+    // tracking.
+    bool button_gated = false;
 
     // Smoothing / control-shaping parameters applied to the follower's
     // commanded positions.
@@ -125,6 +131,8 @@ void usage(const char* prog) {
         "  --stall-log-ms MS           (default: 50)\n"
         "  --clear-error               clear arm fault on connect\n"
         "  --model NAME                wxai_v0|pro (default: wxai_v0)\n"
+        "  --button-gated              Glide leader only: start paused; SEL_1 on the leader\n"
+        "                               toggles pause/resume, SEL_2 clears a fault and resumes\n"
         "\n"
         "Smoothing options (applied to commanded follower positions):\n"
         "  --smooth-alpha A            EMA factor in (0,1]; 1.0 disables (default: 0.35)\n"
@@ -170,6 +178,7 @@ Options parse(int argc, char** argv) {
         else if (a == "--stall-log-ms")        o.stall_log_ms = ta::parse_double(ta::require_value(a, argc, argv, i), a);
         else if (a == "--clear-error")         o.clear_error = true;
         else if (a == "--model")               o.model_str = ta::require_value(a, argc, argv, i);
+        else if (a == "--button-gated")        o.button_gated = true;
         else if (a == "--smooth-alpha")        o.smooth_alpha = ta::parse_double(ta::require_value(a, argc, argv, i), a);
         else if (a == "--max-step")            o.max_step = ta::parse_double(ta::require_value(a, argc, argv, i), a);
         else if (a == "--initial-sync-time")   o.initial_sync_time = ta::parse_double(ta::require_value(a, argc, argv, i), a);
@@ -249,6 +258,16 @@ int main(int argc, char** argv) try {
                                      opt.connect_timeout,
                                      model_cfg.model);
 
+    // Widen the arm joints' velocity/effort fault tolerance to their max
+    {
+        auto joint_limits = driver->get_joint_limits();
+        for (int i = 0; i < 6; ++i) {
+            joint_limits[i].velocity_tolerance = joint_limits[i].velocity_max;
+            joint_limits[i].effort_tolerance = joint_limits[i].effort_max;
+        }
+        driver->set_joint_limits(joint_limits);
+    }
+
     // Park guard fires on every exit path (normal return, thrown
     // handshake timeout, decode/driver fault, signal-driven loop break).
     // Declared before the streamer so the camera stops first on
@@ -323,8 +342,12 @@ int main(int argc, char** argv) try {
     const auto effort_topic         = ta::topics::effort_of(opt.robot);
     const auto leader_ready_topic   = ta::topics::leader_ready_of(opt.robot);
     const auto follower_ready_topic = ta::topics::follower_ready_of(opt.robot);
+    const auto teleop_toggle_topic  = ta::topics::teleop_toggle_of(opt.robot);
+    const auto error_recover_topic  = ta::topics::error_recover_of(opt.robot);
     // Leader state runs on the SDK's receive thread, off the control loop.
     ta::LatestSubscriber state_sub(session, state_topic);
+    ta::LatestSubscriber teleop_toggle_sub(session, teleop_toggle_topic);
+    ta::LatestSubscriber error_recover_sub(session, error_recover_topic);
     auto ready_sub = session.subscribe(leader_ready_topic);
 
     std::cout << "follower: moving to home\n";
@@ -358,15 +381,77 @@ int main(int argc, char** argv) try {
                          std::chrono::duration<double>(opt.stats_interval_s));
     }
 
+    // --button-gated state: a Glide leader's SEL_1 toggles Paused/Active,
+    // SEL_2 clears a fault and resumes.
+    enum class TeleopState { Paused, Active };
+    TeleopState state = opt.button_gated ? TeleopState::Paused : TeleopState::Active;
+    ta::recovery::ArmFaultTracker fault_tracker("follower");
+    std::vector<std::uint8_t> teleop_toggle_buf;
+    std::vector<std::uint8_t> error_recover_buf;
+
+    // Wraps a driver call: guarded (caught, fault-tracked) when
+    // --button-gated, called directly (exceptions propagate as before)
+    // otherwise.
+    auto maybe_guard = [&](auto&& fn) {
+        if (opt.button_gated) return fault_tracker.guard(std::forward<decltype(fn)>(fn));
+        fn();
+        return true;
+    };
+
+    if (opt.button_gated) {
+        std::cout << "follower: --button-gated: waiting for the leader's SEL_1 button to start teleop\n";
+    }
+
     while (!ta::stop_requested() && std::chrono::steady_clock::now() < loop_end) {
         const auto loop_start = std::chrono::steady_clock::now();
 
-        // Always emit the latest effort reading.
-        const auto efforts = driver->get_all_external_efforts();
-        const auto effort_payload = ta::wire::encode_efforts(ta::wire::now_seconds(), efforts);
-        effort_latest.put(effort_payload.data(), effort_payload.size());
+        // Always attempt to emit the latest effort reading; guarded only in
+        // --button-gated mode.
+        maybe_guard([&] {
+            const auto efforts = driver->get_all_external_efforts();
+            const auto effort_payload = ta::wire::encode_efforts(ta::wire::now_seconds(), efforts);
+            effort_latest.put(effort_payload.data(), effort_payload.size());
+        });
 
-        if (state_sub.poll(state_buf)) {
+        if (opt.button_gated) {
+            // SEL_1: toggle pause/resume. Ignored while faulted — clear the
+            // fault first (SEL_2). Resuming always ramps back to the
+            // leader's current pose rather than snapping.
+            if (teleop_toggle_sub.poll(teleop_toggle_buf)) {
+                double ts = 0.0;
+                if (ta::wire::decode_ready(teleop_toggle_buf.data(), teleop_toggle_buf.size(), &ts) &&
+                    ts >= teleop_started_at) {
+                    if (fault_tracker.faulted()) {
+                        std::cout << "follower: ignoring pause/resume — faulted; press the error-recovery button first\n";
+                    } else if (state == TeleopState::Paused) {
+                        state = TeleopState::Active;
+                        synced = false;
+                        std::cout << "follower: teleop resumed (leader button)\n";
+                    } else {
+                        state = TeleopState::Paused;
+                        std::cout << "follower: teleop paused (leader button)\n";
+                    }
+                }
+            }
+
+            // SEL_2: clear a fault (blocking reconnect) and resume.
+            if (error_recover_sub.poll(error_recover_buf)) {
+                double ts = 0.0;
+                if (ta::wire::decode_ready(error_recover_buf.data(), error_recover_buf.size(), &ts) &&
+                    ts >= teleop_started_at) {
+                    if (!fault_tracker.faulted()) {
+                        std::cout << "follower: error-recovery button pressed but there is no active fault\n";
+                    } else if (fault_tracker.try_clear(*driver)) {
+                        driver->set_all_modes(trossen_arm::Mode::position);
+                        state = TeleopState::Active;
+                        synced = false;
+                        std::cout << "follower: fault cleared (leader button), resuming teleop\n";
+                    }
+                }
+            }
+        }
+
+        if (state == TeleopState::Active && state_sub.poll(state_buf)) {
             try {
                 const auto s = ta::wire::decode_state(state_buf.data(), state_buf.size());
                 if (s.timestamp >= teleop_started_at) {
@@ -375,29 +460,31 @@ int main(int argc, char** argv) try {
                         std::max(0.0, (ta::wire::now_seconds() - s.timestamp) * 1000.0);
                     latencies_ms.push_back(latency_ms);
 
-                    if (!synced) {
-                        // First fresh sample: ramp into the leader pose over
-                        // initial-sync-time so we don't snap from home with a
-                        // single 100 Hz step.
-                        std::cout << "follower: syncing to first leader pose over "
-                                  << opt.initial_sync_time << "s\n";
-                        driver->set_all_positions(s.positions, opt.initial_sync_time, true);
-                        last_command = s.positions;
-                        synced = true;
-                    } else {
-                        // EMA toward the target, then optional per-tick clamp.
-                        for (std::size_t i = 0; i < s.positions.size(); ++i) {
-                            const double prev = last_command[i];
-                            double value = prev + opt.smooth_alpha * (s.positions[i] - prev);
-                            if (opt.max_step) {
-                                const double max = *opt.max_step;
-                                value = std::clamp(value, prev - max, prev + max);
+                    maybe_guard([&] {
+                        if (!synced) {
+                            // First fresh sample: ramp into the leader pose over
+                            // initial-sync-time so we don't snap from home with a
+                            // single 100 Hz step.
+                            std::cout << "follower: syncing to first leader pose over "
+                                      << opt.initial_sync_time << "s\n";
+                            driver->set_all_positions(s.positions, opt.initial_sync_time, true);
+                            last_command = s.positions;
+                            synced = true;
+                        } else {
+                            // EMA toward the target, then optional per-tick clamp.
+                            for (std::size_t i = 0; i < s.positions.size(); ++i) {
+                                const double prev = last_command[i];
+                                double value = prev + opt.smooth_alpha * (s.positions[i] - prev);
+                                if (opt.max_step) {
+                                    const double max = *opt.max_step;
+                                    value = std::clamp(value, prev - max, prev + max);
+                                }
+                                command_buf[i] = value;
                             }
-                            command_buf[i] = value;
+                            driver->set_all_positions(command_buf, opt.command_time, false, s.velocities);
+                            last_command = command_buf;
                         }
-                        driver->set_all_positions(command_buf, opt.command_time, false, s.velocities);
-                        last_command = command_buf;
-                    }
+                    });
                 }
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "follower: bad state payload: %s\n", e.what());

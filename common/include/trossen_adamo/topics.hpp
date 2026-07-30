@@ -41,4 +41,26 @@ inline std::string effort_right_of(const std::string& robot) {
     return robot + "/trossen/reference/follower_effort_right";
 }
 
+// Glide-button-driven teleop control (--button-gated): the leader publishes
+// a pulse on each button press; the follower subscribes and reacts. Payload
+// reuses wire::encode_ready/decode_ready (a single timestamp).
+inline std::string teleop_toggle_of(const std::string& robot) {
+    return robot + "/trossen/reference/teleop_toggle";
+}
+inline std::string error_recover_of(const std::string& robot) {
+    return robot + "/trossen/reference/error_recover";
+}
+inline std::string teleop_toggle_left_of(const std::string& robot) {
+    return robot + "/trossen/reference/teleop_toggle_left";
+}
+inline std::string teleop_toggle_right_of(const std::string& robot) {
+    return robot + "/trossen/reference/teleop_toggle_right";
+}
+inline std::string error_recover_left_of(const std::string& robot) {
+    return robot + "/trossen/reference/error_recover_left";
+}
+inline std::string error_recover_right_of(const std::string& robot) {
+    return robot + "/trossen/reference/error_recover_right";
+}
+
 }  // namespace trossen_adamo::topics
