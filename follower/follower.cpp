@@ -84,7 +84,7 @@ struct Options {
     int         camera_height = 480;
     int         camera_fps = 30;
     int         camera_bitrate_kbps = 4000;
-    std::string camera_resolution_str = "SVGA";  // zed backend only
+    std::string camera_resolution_str = "HD1200";  // zed backend only
 };
 
 struct FollowerModelConfig {
@@ -157,7 +157,7 @@ void usage(const char* prog) {
         "  --camera-serial SERIAL      pin to a specific device (RealSense serial or ZED serial)\n"
         "  --camera-width N            RealSense only (default: 640)\n"
         "  --camera-height N           RealSense only (default: 480)\n"
-        "  --camera-resolution RES     ZED only: HD2K|HD1200|HD1080|HD720|SVGA|VGA (default: SVGA)\n"
+        "  --camera-resolution RES     ZED only: HD2K|HD1200|HD1080|HD720|SVGA|VGA (default: HD1200)\n"
         "  --camera-fps N              (default: 30)\n"
         "  --camera-bitrate-kbps N     (default: 4000)\n",
         prog);
@@ -372,6 +372,8 @@ int main(int argc, char** argv) try {
     bool synced = false;
     std::vector<double> last_command;        // EMA history; populated on first sample
     std::vector<double> command_buf(ta::wire::kNumJoints, 0.0);
+    std::vector<double> sync_start;          // follower position when the current sync ramp began
+    std::optional<std::chrono::steady_clock::time_point> sync_started_at;
     std::vector<std::uint8_t> state_buf;     // reused; capacity stable after warm-up
     std::vector<double> latencies_ms;        // ring of leader-publish → here latencies
     latencies_ms.reserve(static_cast<std::size_t>(opt.rate_hz * opt.stats_interval_s) + 64);
@@ -428,6 +430,7 @@ int main(int argc, char** argv) try {
                     } else if (state == TeleopState::Stopped) {
                         state = TeleopState::Active;
                         synced = false;
+                        sync_started_at.reset();
                         std::cout << "follower: teleop started (leader button)\n";
                     } else {
                         maybe_guard([&] { ta::arm::move_home(*driver); });
@@ -448,6 +451,7 @@ int main(int argc, char** argv) try {
                         driver->set_all_modes(trossen_arm::Mode::position);
                             state = TeleopState::Active;
                             synced = false;
+                            sync_started_at.reset();
                             std::cout << "follower: fault cleared (leader button), resuming teleop\n";
                     }
                 }
@@ -465,14 +469,30 @@ int main(int argc, char** argv) try {
 
                     maybe_guard([&] {
                         if (!synced) {
-                            // First fresh sample: ramp into the leader pose over
-                            // initial-sync-time so we don't snap from home with a
-                            // single 100 Hz step.
-                            std::cout << "follower: syncing to first leader pose over "
-                                      << opt.initial_sync_time << "s\n";
-                            driver->set_all_positions(s.positions, opt.initial_sync_time, true);
-                            last_command = s.positions;
-                            synced = true;
+                            // Non-blocking ramp toward the leader's live pose
+                            // (re-sampled each tick) instead of one blocking
+                            // move to a stale snapshot -- avoids a jump when
+                            // steady-state tracking takes over.
+                            if (!sync_started_at) {
+                                sync_start = driver->get_all_positions();
+                                sync_started_at = std::chrono::steady_clock::now();
+                                std::cout << "follower: syncing to leader pose over "
+                                          << opt.initial_sync_time << "s\n";
+                            }
+                            const double elapsed = std::chrono::duration<double>(
+                                std::chrono::steady_clock::now() - *sync_started_at).count();
+                            const double frac = (opt.initial_sync_time > 0.0)
+                                ? std::clamp(elapsed / opt.initial_sync_time, 0.0, 1.0)
+                                : 1.0;
+                            for (std::size_t i = 0; i < s.positions.size(); ++i) {
+                                command_buf[i] = sync_start[i] + frac * (s.positions[i] - sync_start[i]);
+                            }
+                            driver->set_all_positions(command_buf, opt.command_time, false, s.velocities);
+                            last_command = command_buf;
+                            if (frac >= 2.0) {
+                                synced = true;
+                                sync_started_at.reset();
+                            }
                         } else {
                             // EMA toward the target, then optional per-tick clamp.
                             for (std::size_t i = 0; i < s.positions.size(); ++i) {

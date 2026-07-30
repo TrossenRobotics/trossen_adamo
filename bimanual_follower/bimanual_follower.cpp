@@ -105,7 +105,7 @@ struct Options {
     int         camera_fps          = 30;
     int         camera_bitrate_kbps = 4000;
     // ZED-specific.
-    std::string camera_resolution_str = "SVGA";
+    std::string camera_resolution_str = "HD1200";
 };
 
 struct FollowerModelConfig {
@@ -187,7 +187,7 @@ void usage(const char* prog) {
         "  --camera-serial-3 SERIAL         serial for camera 3 (default: auto)\n"
         "  --camera-width N                 RealSense only (default: 640)\n"
         "  --camera-height N                RealSense only (default: 480)\n"
-        "  --camera-resolution RES          ZED only: HD2K|HD1200|HD1080|HD720|SVGA|VGA (default: SVGA)\n"
+        "  --camera-resolution RES          ZED only: HD2K|HD1200|HD1080|HD720|SVGA|VGA (default: HD1200)\n"
         "  --camera-fps N                   (default: 30)\n"
         "  --camera-bitrate-kbps N          (default: 4000)\n",
         prog);
@@ -295,6 +295,8 @@ struct ArmSmoothState {
     std::vector<double> command_buf = std::vector<double>(trossen_adamo::wire::kNumJoints, 0.0);
     std::vector<double> latencies_ms;
     std::optional<std::chrono::steady_clock::time_point> next_stats;
+    std::vector<double> sync_start;          // arm position when the current sync ramp began
+    std::optional<std::chrono::steady_clock::time_point> sync_started_at;
 };
 
 // Process a decoded state sample for one arm, commanding the driver and updating
@@ -311,11 +313,29 @@ bool process_arm_state(const trossen_adamo::wire::State& s,
     ss.latencies_ms.push_back(latency_ms);
 
     if (!ss.synced) {
-        std::cout << label << ": syncing to first leader pose over "
-                  << opt.initial_sync_time << "s\n";
-        driver.set_all_positions(s.positions, opt.initial_sync_time, true);
-        ss.last_command = s.positions;
-        ss.synced = true;
+        // Non-blocking ramp toward the leader's live pose (re-sampled each
+        // tick) instead of one blocking move to a stale snapshot -- avoids
+        // a jump when steady-state tracking takes over.
+        if (!ss.sync_started_at) {
+            ss.sync_start = driver.get_all_positions();
+            ss.sync_started_at = std::chrono::steady_clock::now();
+            std::cout << label << ": syncing to leader pose over "
+                      << opt.initial_sync_time << "s\n";
+        }
+        const double elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - *ss.sync_started_at).count();
+        const double frac = (opt.initial_sync_time > 0.0)
+            ? std::clamp(elapsed / opt.initial_sync_time, 0.0, 1.0)
+            : 1.0;
+        for (std::size_t i = 0; i < s.positions.size(); ++i) {
+            ss.command_buf[i] = ss.sync_start[i] + frac * (s.positions[i] - ss.sync_start[i]);
+        }
+        driver.set_all_positions(ss.command_buf, opt.command_time, false, s.velocities);
+        ss.last_command = ss.command_buf;
+        if (frac >= 1.0) {
+            ss.synced = true;
+            ss.sync_started_at.reset();
+        }
     } else {
         for (std::size_t i = 0; i < s.positions.size(); ++i) {
             const double prev = ss.last_command[i];
@@ -587,6 +607,7 @@ int main(int argc, char** argv) try {
                     } else if (state_left == TeleopState::Stopped) {
                         state_left = TeleopState::Active;
                         left_ss.synced = false;
+                        left_ss.sync_started_at.reset();
                         std::cout << "bimanual_follower: left teleop started (leader button)\n";
                     } else {
                         maybe_guard_left([&] { ta::arm::move_home(*left_driver); });
@@ -605,6 +626,7 @@ int main(int argc, char** argv) try {
                         left_driver->set_all_modes(trossen_arm::Mode::position);
                         state_left = TeleopState::Active;
                         left_ss.synced = false;
+                        left_ss.sync_started_at.reset();
                         std::cout << "bimanual_follower: left fault cleared (leader button), resuming teleop\n";
                     }
                 }
@@ -620,6 +642,7 @@ int main(int argc, char** argv) try {
                     } else if (state_right == TeleopState::Stopped) {
                         state_right = TeleopState::Active;
                         right_ss.synced = false;
+                        right_ss.sync_started_at.reset();
                         std::cout << "bimanual_follower: right teleop started (leader button)\n";
                     } else {
                         maybe_guard_right([&] { ta::arm::move_home(*right_driver); });
@@ -638,6 +661,7 @@ int main(int argc, char** argv) try {
                         right_driver->set_all_modes(trossen_arm::Mode::position);
                         state_right = TeleopState::Active;
                         right_ss.synced = false;
+                        right_ss.sync_started_at.reset();
                         std::cout << "bimanual_follower: right fault cleared (leader button), resuming teleop\n";
                     }
                 }

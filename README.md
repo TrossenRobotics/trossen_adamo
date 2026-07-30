@@ -175,7 +175,7 @@ Key follower options:
 - `--camera-track NAME` — published track name (default `main`).
 - `--camera-serial <SN>` — pin to a specific device if multiple are plugged in.
 - `--camera-width`/`--camera-height` — RealSense only (default 640×480).
-- `--camera-resolution HD2K|HD1200|HD1080|HD720|SVGA|VGA` — ZED only (default `SVGA`).
+- `--camera-resolution HD2K|HD1200|HD1080|HD720|SVGA|VGA` — ZED only (default `HD1200`).
 
 **Leader**:
 
@@ -227,7 +227,7 @@ build/bimanual_follower/bimanual_follower \
     --camera-track-0 cam0 --camera-serial-0 <SN0> \
     --camera-track-1 cam1 --camera-serial-1 <SN1> \
     --camera-track-2 cam2 --camera-serial-2 <SN2> \
-    --camera-resolution SVGA --camera-fps 30 \
+    --camera-resolution HD1200 --camera-fps 30 \
     --camera-bitrate-kbps 4000
 ```
 
@@ -237,7 +237,7 @@ Key bimanual follower options:
 - `--num-cameras N` — 1–4 for RealSense, 1–3 for ZED (default `3`).
 - `--camera-track-N NAME` / `--camera-serial-N SERIAL` — per-camera track name and serial (N = 0, 1, 2, 3).
 - `--camera-width`/`--camera-height` — RealSense only (default 640×480).
-- `--camera-resolution HD2K|HD1200|HD1080|HD720|SVGA|VGA` — ZED only (default `SVGA`).
+- `--camera-resolution HD2K|HD1200|HD1080|HD720|SVGA|VGA` — ZED only (default `HD1200`).
 - `--no-camera` — disable all camera streamers.
 
 **Bimanual Leader** (Glide arms; right's joint-5 offset is `+π/4`, left's
