@@ -197,10 +197,6 @@ int main(int argc, char** argv) try {
     }
     right_driver->set_joint_limits(right_joint_limits);
 
-    std::cout << "bimanual_leader: joint limits set, teleop running for " << opt.teleoperation_time << " seconds\n";
-    std::cout << "bimanual_leader: right_joint_limits.back().position_max = " << right_joint_limits.back().position_max << "\n";
-    std::cout << "bimanual_leader: left_joint_limits.back().position_max = " << left_joint_limits.back().position_max << "\n";
-
     // Park guards: declared after both configure() calls so they fire on
     // every exit path from here on (exception, signal-driven loop break, etc.).
     ta::arm::ArmParkGuard left_park(*left_driver,   "bimanual_leader_left");
