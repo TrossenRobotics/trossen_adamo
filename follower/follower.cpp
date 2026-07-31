@@ -506,7 +506,7 @@ int main(int argc, char** argv) try {
                             }
                             driver->set_all_positions(command_buf, opt.command_time, false, s.velocities);
                             last_command = command_buf;
-                            if (frac >= 2.0) {
+                            if (frac >= 1.0) {
                                 synced = true;
                                 sync_started_at.reset();
                             }
