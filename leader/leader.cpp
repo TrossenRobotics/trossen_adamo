@@ -168,8 +168,10 @@ int main(int argc, char** argv) try {
     const auto teleop_toggle_topic = ta::topics::teleop_toggle_of(opt.robot);
     const auto error_recover_topic = ta::topics::error_recover_of(opt.robot);
     const auto leader_fault_topic  = ta::topics::leader_fault_of(opt.robot);
+    const auto follower_status_topic = ta::topics::follower_status_of(opt.robot);
     // Effort feedback runs on the SDK's receive thread, off the control loop.
     ta::LatestSubscriber effort_sub(session, effort_topic);
+    ta::LatestSubscriber follower_status_sub(session, follower_status_topic);
     auto ready_sub = session.subscribe(follower_ready_topic);
     auto teleop_toggle_pub = session.publisher(teleop_toggle_topic, 250, true, false);
     auto error_recover_pub = session.publisher(error_recover_topic, 250, true, false);
@@ -202,6 +204,7 @@ int main(int argc, char** argv) try {
 
     std::vector<std::uint8_t> effort_buf;     // reused; capacity stable after warm-up
     std::vector<double> applied(ta::wire::kNumJoints - 1, 0.0);  // joints 0-5
+    std::vector<std::uint8_t> follower_status_buf;
 
     // Glide-only: SEL_1 starts/stops the follower's teleop, SEL_2 clears a
     // follower fault and resumes. See trossen_adamo/recovery.hpp and
@@ -221,6 +224,16 @@ int main(int argc, char** argv) try {
         fn();
         return true;
     };
+
+    // Glide-only: drive the leader's button LEDs from the follower's
+    // reported status plus this leader's own fault state (see
+    // recovery.hpp). Starts on "Stopped" (SEL_1 breathing) so the operator
+    // has a cue even before the follower's first status pulse arrives.
+    double follower_status = ta::recovery::kFollowerStatusStopped;
+    ta::recovery::LedState led_state = ta::recovery::LedState::Stopped;
+    if (glide_leader) {
+        maybe_guard([&] { driver->set_input_command(ta::recovery::make_led_command(led_state)); });
+    }
 
     while (!ta::stop_requested() && std::chrono::steady_clock::now() < loop_end) {
         const auto loop_start = std::chrono::steady_clock::now();
@@ -328,6 +341,28 @@ int main(int argc, char** argv) try {
                 std::cout << "leader: error-recovery button pressed, notifying follower\n";
                 const auto p = ta::wire::encode_ready(ta::wire::now_seconds());
                 error_recover_pub.put(p.data(), p.size());
+            }
+
+            // Update the button LEDs to match the follower's latest status
+            // (or this leader's own fault, which always wins) -- only when
+            // the desired pattern actually changes.
+            if (follower_status_sub.poll(follower_status_buf)) {
+                ta::wire::Status st;
+                if (ta::wire::decode_status(follower_status_buf.data(), follower_status_buf.size(), &st) &&
+                    st.timestamp >= teleop_started_at) {
+                    follower_status = st.status;
+                }
+            }
+            const bool error_state = fault_tracker.faulted() ||
+                                     follower_status == ta::recovery::kFollowerStatusFaulted;
+            const auto desired_led = error_state
+                ? ta::recovery::LedState::Error
+                : (follower_status == ta::recovery::kFollowerStatusActive
+                       ? ta::recovery::LedState::Active
+                       : ta::recovery::LedState::Stopped);
+            if (desired_led != led_state) {
+                maybe_guard([&] { driver->set_input_command(ta::recovery::make_led_command(desired_led)); });
+                led_state = desired_led;
             }
         }
 

@@ -4,9 +4,10 @@
 // `struct.pack('!d' * N, ...)` — so other-language implementations stay
 // interoperable.
 //
-//   leader_state   : [timestamp, p0..p6, v0..v6]   = 15 doubles = 120 bytes
-//   follower_effort: [timestamp, e0..e6]           =  8 doubles =  64 bytes
-//   *_ready        : [timestamp]                   =  1 double  =   8 bytes
+//   leader_state    : [timestamp, p0..p6, v0..v6]   = 15 doubles = 120 bytes
+//   follower_effort : [timestamp, e0..e6]           =  8 doubles =  64 bytes
+//   *_ready         : [timestamp]                   =  1 double  =   8 bytes
+//   follower_status : [timestamp, status]           =  2 doubles =  16 bytes
 
 #pragma once
 
@@ -23,6 +24,7 @@ inline constexpr int kNumJoints = 7;
 inline constexpr std::size_t kStateBytes  = (1 + kNumJoints * 2) * sizeof(double);
 inline constexpr std::size_t kEffortBytes = (1 + kNumJoints) * sizeof(double);
 inline constexpr std::size_t kReadyBytes  = sizeof(double);
+inline constexpr std::size_t kStatusBytes = 2 * sizeof(double);
 
 inline std::uint64_t bswap64(std::uint64_t v) noexcept {
 #if defined(__GNUC__) || defined(__clang__)
@@ -143,6 +145,25 @@ inline std::array<std::uint8_t, kReadyBytes> encode_ready(double timestamp) {
 inline bool decode_ready(const std::uint8_t* data, std::size_t len, double* out) {
     if (len != kReadyBytes || data == nullptr || out == nullptr) return false;
     *out = unpack_be_double(data);
+    return true;
+}
+
+inline std::array<std::uint8_t, kStatusBytes> encode_status(double timestamp, double status) {
+    std::array<std::uint8_t, kStatusBytes> out{};
+    pack_be_double(timestamp, out.data());
+    pack_be_double(status, out.data() + sizeof(double));
+    return out;
+}
+
+struct Status {
+    double timestamp = 0.0;
+    double status = 0.0;
+};
+
+inline bool decode_status(const std::uint8_t* data, std::size_t len, Status* out) {
+    if (len != kStatusBytes || data == nullptr || out == nullptr) return false;
+    out->timestamp = unpack_be_double(data);
+    out->status = unpack_be_double(data + sizeof(double));
     return true;
 }
 

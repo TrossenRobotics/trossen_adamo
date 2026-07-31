@@ -62,6 +62,13 @@ before SEL_1 was pressed to resume teleop, the leader exits — otherwise it
 waits for SEL_1 to resume normally. A fault after teleop has genuinely
 resumed is treated as new and goes through the same recovery again.
 
+**Button LEDs** guide the operator through the states above (Glide's LEDs are
+monochrome — on/off/breathe, no color — so "needs attention" is a pulse, not
+red):
+- **Stopped**: SEL_1 breathes — press it to start.
+- **Teleop active**: all four LEDs solid.
+- **Error** (follower or leader fault): SEL_2 breathes — press it to recover.
+
 ### Bimanual Teleop
 
 Two binaries on two hosts, each driving **two** arms (right + left) — the
@@ -271,7 +278,9 @@ sleep). `--help` on either binary prints the full flag list.
 Each side's Glide leader self-recovers from its own driver faults the same
 way as the single-arm case above (independently — a fault on one side
 doesn't affect the other), and each side's `--button-gated` `bimanual_follower`
-behaves the same as the single-arm follower's SEL_1/SEL_2.
+behaves the same as the single-arm follower's SEL_1/SEL_2. Each side's
+button LEDs are driven independently too — same Stopped/Active/Error
+patterns as above.
 
 ### VR Teleoperation
 

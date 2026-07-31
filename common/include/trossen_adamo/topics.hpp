@@ -77,4 +77,17 @@ inline std::string leader_fault_right_of(const std::string& robot) {
     return robot + "/trossen/reference/leader_fault_right";
 }
 
+// Follower -> leader status, driving the Glide leader's button LEDs (see
+// recovery.hpp's LedState/make_led_command). Payload is wire::encode_status
+// (timestamp + a status code).
+inline std::string follower_status_of(const std::string& robot) {
+    return robot + "/trossen/reference/follower_status";
+}
+inline std::string follower_status_left_of(const std::string& robot) {
+    return robot + "/trossen/reference/follower_status_left";
+}
+inline std::string follower_status_right_of(const std::string& robot) {
+    return robot + "/trossen/reference/follower_status_right";
+}
+
 }  // namespace trossen_adamo::topics

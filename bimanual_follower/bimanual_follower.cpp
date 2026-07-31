@@ -508,6 +508,8 @@ int main(int argc, char** argv) try {
     const auto error_recover_right_topic = ta::topics::error_recover_right_of(opt.robot);
     const auto leader_fault_left_topic   = ta::topics::leader_fault_left_of(opt.robot);
     const auto leader_fault_right_topic  = ta::topics::leader_fault_right_of(opt.robot);
+    const auto follower_status_left_topic  = ta::topics::follower_status_left_of(opt.robot);
+    const auto follower_status_right_topic = ta::topics::follower_status_right_of(opt.robot);
 
     // Leader state subscribers run on the SDK's receive thread.
     ta::LatestSubscriber state_left_sub(session,  state_left_topic);
@@ -529,6 +531,10 @@ int main(int argc, char** argv) try {
     auto effort_right_pub = session.publisher(effort_right_topic,   250, true, false);
     ta::LatestPublisher effort_left_latest(std::move(effort_left_pub));
     ta::LatestPublisher effort_right_latest(std::move(effort_right_pub));
+    auto follower_status_left_pub  = session.publisher(follower_status_left_topic,  250, true, false);
+    auto follower_status_right_pub = session.publisher(follower_status_right_topic, 250, true, false);
+    ta::LatestPublisher follower_status_left_latest(std::move(follower_status_left_pub));
+    ta::LatestPublisher follower_status_right_latest(std::move(follower_status_right_pub));
 
     ta::handshake::wait_for_peer_ready(ready_pub, ready_sub, opt.ready_timeout, "leader");
 
@@ -724,6 +730,25 @@ int main(int argc, char** argv) try {
 
         maybe_print_stats(left_ss,  opt, "bimanual_follower_left");
         maybe_print_stats(right_ss, opt, "bimanual_follower_right");
+
+        // Report status for each side's leader button LEDs (see
+        // recovery.hpp). Published unconditionally, even while faulted, so
+        // the leader can show the error state.
+        {
+            const double left_status =
+                fault_tracker_left.faulted()      ? ta::recovery::kFollowerStatusFaulted
+                : state_left == TeleopState::Active ? ta::recovery::kFollowerStatusActive
+                                                     : ta::recovery::kFollowerStatusStopped;
+            const auto left_payload = ta::wire::encode_status(ta::wire::now_seconds(), left_status);
+            follower_status_left_latest.put(left_payload.data(), left_payload.size());
+
+            const double right_status =
+                fault_tracker_right.faulted()      ? ta::recovery::kFollowerStatusFaulted
+                : state_right == TeleopState::Active ? ta::recovery::kFollowerStatusActive
+                                                      : ta::recovery::kFollowerStatusStopped;
+            const auto right_payload = ta::wire::encode_status(ta::wire::now_seconds(), right_status);
+            follower_status_right_latest.put(right_payload.data(), right_payload.size());
+        }
 
         const auto elapsed_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - loop_start).count();

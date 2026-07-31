@@ -93,4 +93,31 @@ private:
     std::uint8_t prev_ = 0;
 };
 
+// Wire status codes published by the follower (see topics::follower_status_of)
+// and consumed by the leader to drive its Glide button LEDs. Doubles for
+// wire::encode_status/decode_status consistency.
+inline constexpr double kFollowerStatusStopped = 0.0;
+inline constexpr double kFollowerStatusActive  = 1.0;
+inline constexpr double kFollowerStatusFaulted = 2.0;
+
+// Glide leader button-LED guide: SEL_1 = start/stop, SEL_2 = error recovery,
+// SEL_3/4 unused. The LEDs are monochrome (per-button off/solid/breathe,
+// one shared brightness) -- no color -- so "needs attention" is conveyed by
+// breathing (pulsing) rather than a color change.
+enum class LedState { Stopped, Active, Error };
+
+// Stopped: SEL_1 breathes, inviting a press to start.
+// Active: all four solid -- an unambiguous "teleop is live" signal.
+// Error: SEL_2 breathes, inviting a press to recover; everything else off.
+inline trossen_arm::InputCommand make_led_command(LedState state) {
+    trossen_arm::InputCommand cmd;
+    cmd.button_led_brightness = 200;
+    switch (state) {
+        case LedState::Stopped: cmd.button_led_effects = {2, 0, 0, 0}; break;
+        case LedState::Active:  cmd.button_led_effects = {1, 1, 1, 1}; break;
+        case LedState::Error:   cmd.button_led_effects = {0, 2, 0, 0}; break;
+    }
+    return cmd;
+}
+
 }  // namespace trossen_adamo::recovery

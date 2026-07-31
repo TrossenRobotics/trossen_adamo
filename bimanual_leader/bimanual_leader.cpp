@@ -217,10 +217,14 @@ int main(int argc, char** argv) try {
     const auto error_recover_right_topic = ta::topics::error_recover_right_of(opt.robot);
     const auto leader_fault_left_topic   = ta::topics::leader_fault_left_of(opt.robot);
     const auto leader_fault_right_topic  = ta::topics::leader_fault_right_of(opt.robot);
+    const auto follower_status_left_topic  = ta::topics::follower_status_left_of(opt.robot);
+    const auto follower_status_right_topic = ta::topics::follower_status_right_of(opt.robot);
 
     // Effort feedback runs on the SDK's receive thread, off the control loop.
     ta::LatestSubscriber effort_left_sub(session,  effort_left_topic);
     ta::LatestSubscriber effort_right_sub(session, effort_right_topic);
+    ta::LatestSubscriber follower_status_left_sub(session,  follower_status_left_topic);
+    ta::LatestSubscriber follower_status_right_sub(session, follower_status_right_topic);
     auto ready_sub = session.subscribe(follower_ready_topic);
     auto teleop_toggle_left_pub  = session.publisher(teleop_toggle_left_topic,  250, true, false);
     auto teleop_toggle_right_pub = session.publisher(teleop_toggle_right_topic, 250, true, false);
@@ -264,6 +268,7 @@ int main(int argc, char** argv) try {
     std::vector<std::uint8_t> effort_right_buf;
     std::vector<double> applied_left(ta::wire::kNumJoints - 1, 0.0);   // joints 0-5
     std::vector<double> applied_right(ta::wire::kNumJoints - 1, 0.0);
+    std::vector<std::uint8_t> follower_status_left_buf, follower_status_right_buf;
 
     // Glide-only per side: SEL_1 starts/stops that side's follower teleop,
     // SEL_2 clears that side's follower fault and resumes. Left glide ->
@@ -292,6 +297,20 @@ int main(int argc, char** argv) try {
         fn();
         return true;
     };
+
+    // Glide-only per side: drive each leader's button LEDs from its own
+    // follower's reported status plus that side's own fault state (see
+    // recovery.hpp). Starts on "Stopped" (SEL_1 breathing).
+    double left_follower_status  = ta::recovery::kFollowerStatusStopped;
+    double right_follower_status = ta::recovery::kFollowerStatusStopped;
+    ta::recovery::LedState left_led_state  = ta::recovery::LedState::Stopped;
+    ta::recovery::LedState right_led_state = ta::recovery::LedState::Stopped;
+    if (left_is_glide) {
+        maybe_guard_left([&] { left_driver->set_input_command(ta::recovery::make_led_command(left_led_state)); });
+    }
+    if (right_is_glide) {
+        maybe_guard_right([&] { right_driver->set_input_command(ta::recovery::make_led_command(right_led_state)); });
+    }
 
     while (!ta::stop_requested() && std::chrono::steady_clock::now() < loop_end) {
         const auto loop_start = std::chrono::steady_clock::now();
@@ -459,6 +478,50 @@ int main(int argc, char** argv) try {
                 std::cout << "bimanual_leader: right error-recovery button pressed, notifying follower\n";
                 const auto p = ta::wire::encode_ready(ta::wire::now_seconds());
                 error_recover_right_pub.put(p.data(), p.size());
+            }
+        }
+
+        // Update each side's button LEDs to match its follower's latest
+        // status (or that side's own fault, which always wins) -- only
+        // when the desired pattern actually changes.
+        if (left_is_glide) {
+            if (follower_status_left_sub.poll(follower_status_left_buf)) {
+                ta::wire::Status st;
+                if (ta::wire::decode_status(follower_status_left_buf.data(), follower_status_left_buf.size(), &st) &&
+                    st.timestamp >= teleop_started_at) {
+                    left_follower_status = st.status;
+                }
+            }
+            const bool left_error = left_fault_tracker.faulted() ||
+                                    left_follower_status == ta::recovery::kFollowerStatusFaulted;
+            const auto desired_left_led = left_error
+                ? ta::recovery::LedState::Error
+                : (left_follower_status == ta::recovery::kFollowerStatusActive
+                       ? ta::recovery::LedState::Active
+                       : ta::recovery::LedState::Stopped);
+            if (desired_left_led != left_led_state) {
+                maybe_guard_left([&] { left_driver->set_input_command(ta::recovery::make_led_command(desired_left_led)); });
+                left_led_state = desired_left_led;
+            }
+        }
+        if (right_is_glide) {
+            if (follower_status_right_sub.poll(follower_status_right_buf)) {
+                ta::wire::Status st;
+                if (ta::wire::decode_status(follower_status_right_buf.data(), follower_status_right_buf.size(), &st) &&
+                    st.timestamp >= teleop_started_at) {
+                    right_follower_status = st.status;
+                }
+            }
+            const bool right_error = right_fault_tracker.faulted() ||
+                                     right_follower_status == ta::recovery::kFollowerStatusFaulted;
+            const auto desired_right_led = right_error
+                ? ta::recovery::LedState::Error
+                : (right_follower_status == ta::recovery::kFollowerStatusActive
+                       ? ta::recovery::LedState::Active
+                       : ta::recovery::LedState::Stopped);
+            if (desired_right_led != right_led_state) {
+                maybe_guard_right([&] { right_driver->set_input_command(ta::recovery::make_led_command(desired_right_led)); });
+                right_led_state = desired_right_led;
             }
         }
 

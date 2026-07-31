@@ -346,6 +346,7 @@ int main(int argc, char** argv) try {
     const auto teleop_toggle_topic  = ta::topics::teleop_toggle_of(opt.robot);
     const auto error_recover_topic  = ta::topics::error_recover_of(opt.robot);
     const auto leader_fault_topic   = ta::topics::leader_fault_of(opt.robot);
+    const auto follower_status_topic = ta::topics::follower_status_of(opt.robot);
     // Leader state runs on the SDK's receive thread, off the control loop.
     ta::LatestSubscriber state_sub(session, state_topic);
     ta::LatestSubscriber teleop_toggle_sub(session, teleop_toggle_topic);
@@ -359,6 +360,8 @@ int main(int argc, char** argv) try {
     auto ready_pub  = session.publisher(follower_ready_topic, 250, true, false);
     auto effort_pub = session.publisher(effort_topic,         250, true, false);
     ta::LatestPublisher effort_latest(std::move(effort_pub));
+    auto follower_status_pub = session.publisher(follower_status_topic, 250, true, false);
+    ta::LatestPublisher follower_status_latest(std::move(follower_status_pub));
 
     ta::handshake::wait_for_peer_ready(ready_pub, ready_sub, opt.ready_timeout, "leader");
 
@@ -529,6 +532,17 @@ int main(int argc, char** argv) try {
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "follower: bad state payload: %s\n", e.what());
             }
+        }
+
+        // Report status for the leader's button LEDs (see recovery.hpp).
+        // Published unconditionally, even while faulted, so the leader can
+        // show the error state.
+        {
+            const double status = fault_tracker.faulted()   ? ta::recovery::kFollowerStatusFaulted
+                                 : state == TeleopState::Active ? ta::recovery::kFollowerStatusActive
+                                                                 : ta::recovery::kFollowerStatusStopped;
+            const auto status_payload = ta::wire::encode_status(ta::wire::now_seconds(), status);
+            follower_status_latest.put(status_payload.data(), status_payload.size());
         }
 
         // Periodic latency stats (p50 / p95 / max). Cleared each interval.
