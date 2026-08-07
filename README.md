@@ -189,7 +189,7 @@ Key follower options:
 - `--camera-track NAME` — published track name (default `main`).
 - `--camera-serial <SN>` — pin to a specific device if multiple are plugged in.
 - `--camera-width`/`--camera-height` — RealSense only (default 640×480).
-- `--camera-resolution HD2K|HD1200|HD1080|HD720|SVGA|VGA` — ZED only (default `HD1200`).
+- `--camera-resolution HD2K|HD1200|HD1080|HD720|SVGA|VGA` — ZED only (default `HD1200`). This is the **output** resolution; the camera always captures at native HD1200 internally (Rogue Carrier for NVIDIA Jetson AGX Orin rigs require this — any other init resolution wedges `nvargus-daemon`).
 
 **Leader**:
 
@@ -251,7 +251,7 @@ Key bimanual follower options:
 - `--num-cameras N` — 1–4 for RealSense, 1–3 for ZED (default `3`).
 - `--camera-track-N NAME` / `--camera-serial-N SERIAL` — per-camera track name and serial (N = 0, 1, 2, 3).
 - `--camera-width`/`--camera-height` — RealSense only (default 640×480).
-- `--camera-resolution HD2K|HD1200|HD1080|HD720|SVGA|VGA` — ZED only (default `HD1200`).
+- `--camera-resolution HD2K|HD1200|HD1080|HD720|SVGA|VGA` — ZED only (default `HD1200`). Output resolution only; capture always at HD1200 (Rogue Carrier for NVIDIA Jetson AGX Orin constraint).
 - `--no-camera` — disable all camera streamers.
 
 **Bimanual Leader** (Glide arms; right's joint-5 offset is `+π/4`, left's

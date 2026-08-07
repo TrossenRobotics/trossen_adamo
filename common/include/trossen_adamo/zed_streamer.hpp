@@ -25,8 +25,10 @@ struct ZedConfig {
     std::string api_key;
     std::string robot;
     std::string track = "main";
-    std::string serial;                                   // empty = first available
-    sl::RESOLUTION resolution = sl::RESOLUTION::HD1200;    // ZED X (Nano) native resolution
+    std::string serial;                          // empty = first available
+    // Output resolution streamed to Adamo.  Camera always opens at HD1200
+    // internally (CTI/Rogue Jetson board constraint); this is used only for downsampling.
+    sl::RESOLUTION resolution = sl::RESOLUTION::SVGA;
     int fps = 30;
     int bitrate_kbps = 4000;
     adamo::Protocol protocol = adamo::Protocol::Quic;
@@ -46,9 +48,13 @@ public:
         throw std::runtime_error("ZED streamer requires Adamo built with ADAMO_BUILD_VIDEO=ON");
 #else
         sl::InitParameters init_params;
-        init_params.camera_resolution = cfg_.resolution;
+        // Always open at native HD1200: CTI/Rogue Jetson board rigs only accept the sensor's
+        // native resolution from nvargus-daemon.  Any other value causes SIGABRT.
+        // Downsampling to cfg_.resolution happens in retrieveImage() below,
+        // exactly as nvvidconv does in the GStreamer capture pipeline.
+        init_params.camera_resolution = sl::RESOLUTION::HD1200;
         init_params.camera_fps = cfg_.fps;
-        init_params.depth_mode = sl::DEPTH_MODE::NONE;  // color-only; no depth/point-cloud needed
+        init_params.depth_mode = sl::DEPTH_MODE::NONE;
         if (!cfg_.serial.empty()) {
             init_params.input.setFromSerialNumber(
                 static_cast<unsigned int>(std::stoul(cfg_.serial)));
@@ -61,20 +67,23 @@ public:
             throw std::runtime_error(oss.str());
         }
 
-        const auto& config = zed_.getCameraInformation().camera_configuration;
-        const int width  = static_cast<int>(config.resolution.width);
-        const int height = static_cast<int>(config.resolution.height);
-        const int fps    = static_cast<int>(config.fps);
+        const auto& cap_cfg = zed_.getCameraInformation().camera_configuration;
+        const int fps = static_cast<int>(cap_cfg.fps);
+
+        // Output resolution the user requested; downsampled from HD1200.
+        const sl::Resolution out_res = resolution_to_dims(cfg_.resolution);
+        const int out_w = static_cast<int>(out_res.width);
+        const int out_h = static_cast<int>(out_res.height);
 
         std::fprintf(stderr,
-            "camera: opening Adamo robot '%s' for video track '%s' (%dx%d@%d, %d kbps)\n",
-            cfg_.robot.c_str(), cfg_.track.c_str(), width, height, fps, cfg_.bitrate_kbps);
+            "camera: capture 1920x1200 -> output %dx%d @%d fps, %d kbps (robot '%s' track '%s')\n",
+            out_w, out_h, fps, cfg_.bitrate_kbps, cfg_.robot.c_str(), cfg_.track.c_str());
 
         auto robot = adamo::Robot::create(cfg_.api_key, cfg_.robot, cfg_.protocol);
         track_ = robot.video(
             cfg_.track,
-            static_cast<std::uint32_t>(width),
-            static_cast<std::uint32_t>(height),
+            static_cast<std::uint32_t>(out_w),
+            static_cast<std::uint32_t>(out_h),
             "BGRA",
             static_cast<std::uint32_t>(fps),
             static_cast<std::uint32_t>(cfg_.bitrate_kbps));
@@ -90,7 +99,7 @@ public:
         // Give the robot a moment to spin up before frames start flowing.
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-        capture_thread_ = std::thread([this, width, height] { capture_loop(width, height); });
+        capture_thread_ = std::thread([this, out_w, out_h] { capture_loop(out_w, out_h); });
         running_ = true;
 #endif
     }
@@ -109,9 +118,13 @@ public:
 
 private:
 #ifdef ADAMO_HAS_VIDEO
-    void capture_loop(int width, int height) {
+    void capture_loop(int out_w, int out_h) {
         sl::Mat image;
-        const std::size_t row_bytes = static_cast<std::size_t>(width) * 4;
+        const std::size_t row_bytes = static_cast<std::size_t>(out_w) * 4;
+        // Pass output size to retrieveImage; ZED SDK bilinearly resizes from
+        // the HD1200 capture frame — equivalent to the nvvidconv step.
+        const sl::Resolution out_res(static_cast<std::size_t>(out_w),
+                                     static_cast<std::size_t>(out_h));
         std::vector<std::uint8_t> scratch;  // only populated if rows are padded
         std::uint64_t frames = 0;
         auto last_report = std::chrono::steady_clock::now();
@@ -120,16 +133,16 @@ private:
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;
             }
-            zed_.retrieveImage(image, sl::VIEW::LEFT, sl::MEM::CPU);
+            zed_.retrieveImage(image, sl::VIEW::LEFT, sl::MEM::CPU, out_res);
 
             const std::size_t step = image.getStepBytes(sl::MEM::CPU);
             auto* base = reinterpret_cast<const std::uint8_t*>(image.getPtr<sl::uchar1>(sl::MEM::CPU));
 
             const std::uint8_t* send_ptr = base;
-            std::size_t send_len = row_bytes * static_cast<std::size_t>(height);
+            std::size_t send_len = row_bytes * static_cast<std::size_t>(out_h);
             if (step != row_bytes) {
                 scratch.resize(send_len);
-                for (int y = 0; y < height; ++y) {
+                for (int y = 0; y < out_h; ++y) {
                     std::memcpy(scratch.data() + static_cast<std::size_t>(y) * row_bytes,
                                 base + static_cast<std::size_t>(y) * step,
                                 row_bytes);
@@ -161,6 +174,19 @@ private:
     std::thread capture_thread_;
     std::atomic<bool> local_stop_{false};
     std::atomic<bool> running_{false};
+
+    // Convert sl::RESOLUTION enum to pixel dimensions for retrieveImage().
+    static sl::Resolution resolution_to_dims(sl::RESOLUTION r) {
+        switch (r) {
+            case sl::RESOLUTION::HD2K:   return sl::Resolution(2208, 1242);
+            case sl::RESOLUTION::HD1200: return sl::Resolution(1920, 1200);
+            case sl::RESOLUTION::HD1080: return sl::Resolution(1920, 1080);
+            case sl::RESOLUTION::HD720:  return sl::Resolution(1280,  720);
+            case sl::RESOLUTION::SVGA:   return sl::Resolution( 960,  600);
+            case sl::RESOLUTION::VGA:    return sl::Resolution( 672,  376);
+            default:                     return sl::Resolution( 960,  600);
+        }
+    }
 #endif
 
     ZedConfig cfg_;
