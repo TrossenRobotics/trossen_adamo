@@ -8,6 +8,12 @@
 // Left arm  → subscribes leader_state_left  / publishes follower_effort_left
 // Right arm → subscribes leader_state_right / publishes follower_effort_right
 //
+// Gaps in the leader stream (--resync-gap-ms, default 100ms):
+//   A gap larger than this re-enters the sync ramp for --resync-time instead of
+//   taking a steady-state smoothing step toward a pose the leader has since left
+//   far behind. Turns a post-gap lurch into a short ease-in. Gaps longer than
+//   --leader-timeout are a pause instead, see below.
+//
 // Leader loss and resume (--leader-timeout, default 5s):
 //   The leader script dying is a pause, not an error. A side that has heard
 //   nothing from its leader for --leader-timeout moves home and enters Paused;
@@ -107,6 +113,18 @@ struct Options {
     double smooth_alpha      = 0.35;
     std::optional<double> max_step;
     double initial_sync_time = 2.0;
+
+    // Gap-triggered re-sync. A gap this large between two arriving leader
+    // samples means the leader has moved further than one steady-state
+    // smoothing step should cover, so the arm re-enters the sync ramp instead of
+    // taking that step: the first command after the gap holds the arm where it
+    // is and the following ones ease into the leader's live pose. 0 disables,
+    // restoring plain EMA smoothing across gaps.
+    double resync_gap_ms = 100.0;
+    // Ramp used for those mid-session re-syncs. Shorter than
+    // --initial-sync-time on purpose: the arm is near the leader pose already,
+    // and a 2s ramp after every hiccup would feel like lag.
+    double resync_time   = 0.5;
     double command_time      = 0.02;
     double stats_interval_s  = 1.0;
 
@@ -192,6 +210,9 @@ void usage(const char* prog) {
         "  --smooth-alpha A                 EMA factor in (0,1]; 1.0 disables (default: 0.35)\n"
         "  --max-step RAD                   per-update absolute joint delta clamp (default: off)\n"
         "  --initial-sync-time SEC          ramp time into first leader pose (default: 2.0)\n"
+        "  --resync-gap-ms MS               gap between arriving leader samples that restarts the\n"
+        "                                   sync ramp instead of stepping; 0 disables (default: 100)\n"
+        "  --resync-time SEC                ramp time for those re-syncs (default: 0.5)\n"
         "  --command-time SEC               controller goal_time during steady state (default: 0.02)\n"
         "  --stats-interval SEC             latency stats print interval; 0 disables (default: 1.0)\n"
         "\n"
@@ -248,6 +269,8 @@ Options parse(int argc, char** argv) {
         else if (a == "--smooth-alpha")        o.smooth_alpha = ta::parse_double(ta::require_value(a, argc, argv, i), a);
         else if (a == "--max-step")            o.max_step = ta::parse_double(ta::require_value(a, argc, argv, i), a);
         else if (a == "--initial-sync-time")   o.initial_sync_time = ta::parse_double(ta::require_value(a, argc, argv, i), a);
+        else if (a == "--resync-gap-ms")       o.resync_gap_ms = ta::parse_double(ta::require_value(a, argc, argv, i), a);
+        else if (a == "--resync-time")         o.resync_time = ta::parse_double(ta::require_value(a, argc, argv, i), a);
         else if (a == "--command-time")        o.command_time = ta::parse_double(ta::require_value(a, argc, argv, i), a);
         else if (a == "--stats-interval")      o.stats_interval_s = ta::parse_double(ta::require_value(a, argc, argv, i), a);
         else if (a == "--no-camera")           o.camera_enabled = false;
@@ -286,6 +309,13 @@ Options parse(int argc, char** argv) {
     if (o.command_time < 0.0)      throw std::runtime_error("--command-time must be >= 0");
     if (o.stats_interval_s < 0.0)  throw std::runtime_error("--stats-interval must be >= 0");
     if (o.leader_timeout <= 0.0)   throw std::runtime_error("--leader-timeout must be > 0");
+    if (o.resync_gap_ms < 0.0)     throw std::runtime_error("--resync-gap-ms must be >= 0");
+    if (o.resync_time < 0.0)       throw std::runtime_error("--resync-time must be >= 0");
+    // Above the pause threshold it could never fire: the pause watchdog would
+    // have homed the arm before a sample that late ever arrived.
+    if (o.resync_gap_ms > 0.0 && o.resync_gap_ms / 1000.0 >= o.leader_timeout) {
+        throw std::runtime_error("--resync-gap-ms must be below --leader-timeout");
+    }
     if (o.camera_enabled) {
 #if defined(ADAMO_TROSSEN_HAS_REALSENSE) && defined(ADAMO_TROSSEN_HAS_ZED)
         if (o.camera_backend != "realsense" && o.camera_backend != "zed") {
@@ -331,6 +361,8 @@ struct ArmSmoothState {
     std::optional<std::chrono::steady_clock::time_point> next_stats;
     std::vector<double> sync_start;          // arm position when the current sync ramp began
     std::optional<std::chrono::steady_clock::time_point> sync_started_at;
+    double sync_time = 0.0;                  // duration of the ramp in progress
+    std::uint64_t resyncs = 0;               // gap-triggered re-syncs this stats interval
 
     // When this side last heard from its leader. Empty means "nothing heard
     // yet", which is why a side that is merely waiting to be started is never
@@ -349,9 +381,38 @@ bool process_arm_state(const trossen_adamo::wire::State& s,
                        const char* label) {
     if (s.timestamp < teleop_started_at) return false;
 
+    const auto arrived_at = std::chrono::steady_clock::now();
     const double latency_ms = std::max(0.0, (trossen_adamo::wire::now_seconds() - s.timestamp) * 1000.0);
     ss.latencies_ms.push_back(latency_ms);
-    ss.last_state_at = std::chrono::steady_clock::now();
+
+    // Gap-triggered re-sync, decided before anything is commanded.
+    //
+    // In steady state each sample moves the arm a fraction of the way to the
+    // leader (smooth_alpha), which assumes samples keep arriving every few ms.
+    // After a gap the leader has moved much further, so that same step becomes a
+    // lurch. Dropping back into the sync ramp turns it into a timed ease
+    // instead: the ramp starts from where the arm actually is and re-samples the
+    // leader's live pose every tick, so the first post-gap command is
+    // effectively "hold" and tracking is handed back smoothly.
+    //
+    // Only from steady state -- a ramp already in progress is doing this job,
+    // and restarting it would throw away the progress it has made.
+    double ramp_time  = opt.initial_sync_time;
+    bool   gap_resync = false;
+    if (opt.resync_gap_ms > 0.0 && ss.synced && ss.last_state_at) {
+        const double gap_ms =
+            std::chrono::duration<double, std::milli>(arrived_at - *ss.last_state_at).count();
+        if (gap_ms > opt.resync_gap_ms) {
+            ss.synced = false;
+            ss.sync_started_at.reset();
+            ramp_time  = opt.resync_time;
+            gap_resync = true;
+            ++ss.resyncs;
+            std::fprintf(stderr, "%s: %.0f ms gap in leader state, re-syncing over %.2fs\n",
+                         label, gap_ms, opt.resync_time);
+        }
+    }
+    ss.last_state_at = arrived_at;
 
     if (!ss.synced) {
         // Non-blocking ramp toward the leader's live pose (re-sampled each
@@ -359,14 +420,19 @@ bool process_arm_state(const trossen_adamo::wire::State& s,
         // a jump when steady-state tracking takes over.
         if (!ss.sync_started_at) {
             ss.sync_start = driver.get_all_positions();
-            ss.sync_started_at = std::chrono::steady_clock::now();
-            std::cout << label << ": syncing to leader pose over "
-                      << opt.initial_sync_time << "s\n";
+            ss.sync_started_at = arrived_at;
+            // Held for the whole ramp: a gap re-sync eases in over
+            // --resync-time, every other sync over --initial-sync-time.
+            ss.sync_time = ramp_time;
+            if (!gap_resync) {
+                std::cout << label << ": syncing to leader pose over "
+                          << ss.sync_time << "s\n";
+            }
         }
         const double elapsed = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - *ss.sync_started_at).count();
-        const double frac = (opt.initial_sync_time > 0.0)
-            ? std::clamp(elapsed / opt.initial_sync_time, 0.0, 1.0)
+            arrived_at - *ss.sync_started_at).count();
+        const double frac = (ss.sync_time > 0.0)
+            ? std::clamp(elapsed / ss.sync_time, 0.0, 1.0)
             : 1.0;
         for (std::size_t i = 0; i < s.positions.size(); ++i) {
             ss.command_buf[i] = ss.sync_start[i] + frac * (s.positions[i] - ss.sync_start[i]);
@@ -405,9 +471,10 @@ void maybe_print_stats(ArmSmoothState& ss, const Options& opt, const char* label
             : ss.latencies_ms.back();
         const double pmax = ss.latencies_ms.back();
         std::fprintf(stderr,
-            "%s stats: samples=%zu latency_ms p50=%.1f p95=%.1f max=%.1f\n",
-            label, n, p50, p95, pmax);
+            "%s stats: samples=%zu latency_ms p50=%.1f p95=%.1f max=%.1f resyncs=%llu\n",
+            label, n, p50, p95, pmax, static_cast<unsigned long long>(ss.resyncs));
         ss.latencies_ms.clear();
+        ss.resyncs = 0;
     }
     *ss.next_stats = std::chrono::steady_clock::now() +
                      std::chrono::duration_cast<std::chrono::steady_clock::duration>(
