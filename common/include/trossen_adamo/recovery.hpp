@@ -99,6 +99,12 @@ private:
 inline constexpr double kFollowerStatusStopped = 0.0;
 inline constexpr double kFollowerStatusActive  = 1.0;
 inline constexpr double kFollowerStatusFaulted = 2.0;
+// Auto-paused because that leader stopped publishing (--leader-timeout). Maps
+// to LedState::Stopped on the leader, i.e. SEL_1 breathes: the arm is home and
+// a press resumes it, which is exactly the invitation we want. Kept a separate
+// code so a leader can tell "you stopped it" from "it paused itself" without
+// the follower having to lie about either.
+inline constexpr double kFollowerStatusPaused  = 3.0;
 
 // Glide leader button-LED guide: SEL_1 = start/stop, SEL_2 = error recovery,
 // SEL_3/4 unused. The LEDs are monochrome (per-button off/solid/breathe,

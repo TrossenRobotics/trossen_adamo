@@ -8,6 +8,16 @@
 // Left arm  → subscribes leader_state_left  / publishes follower_effort_left
 // Right arm → subscribes leader_state_right / publishes follower_effort_right
 //
+// Leader loss and resume (--leader-timeout, default 5s):
+//   The leader script dying is a pause, not an error. A side that has heard
+//   nothing from its leader for --leader-timeout moves home and enters Paused;
+//   this process stays up. When the leader script is running again the follower
+//   sees its state resume and reports Paused-with-leader-back, which breathes
+//   SEL_1 on that Glide leader; pressing SEL_1 resumes teleop with the usual
+//   ramp into the leader's live pose. Nothing but Ctrl-C ends the process, and
+//   follower_ready is republished for the whole session so a restarted leader
+//   can complete its handshake.
+//
 // Camera backends:
 //   realsense  – up to 4 cameras; use --num-cameras 1-4 (default: 3)
 //   zed        – up to 3 cameras; use --num-cameras 1-3 (default: 3)
@@ -15,6 +25,11 @@
 // Per-camera track and serial are configured via:
 //   --camera-track-N NAME    (default: cam0, cam1, cam2, cam3)
 //   --camera-serial-N SERIAL (default: empty = auto-detect)
+//
+// ZED X note: the camera always opens at its native HD1200 (a CTI/Rogue Jetson
+// board constraint -- any other capture resolution aborts in nvargus), so
+// --camera-resolution selects the *output* size the streamer downsamples to
+// before encoding. See zed_streamer.hpp.
 
 #include "adamo/adamo.hpp"
 #include "libtrossen_arm/trossen_arm.hpp"
@@ -40,6 +55,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -68,6 +84,7 @@ struct Options {
     std::string left_model_str  = "wxai_v0";  // wxai_v0 | pro
     std::string right_model_str = "wxai_v0";  // wxai_v0 | pro
     std::string protocol_str = "quic";
+    // Hard deadline for the whole session; 0 means no deadline, run until Ctrl-C.
     double teleoperation_time  = 20.0;
     double connect_timeout     = 20.0;
     double ready_timeout       = 60.0;
@@ -78,6 +95,13 @@ struct Options {
     // Glide-only: start stopped and wait for a leader button press before
     // tracking (applies to both sides).
     bool button_gated = false;
+
+    // Leader-loss pause. A side that has heard nothing from its leader for this
+    // long moves home and pauses instead of holding its last commanded pose
+    // under torque with nobody driving it. Generous on purpose: this is meant
+    // to catch "the leader script is gone", not a late packet. Tightening it
+    // enough to catch stalls needs the staleness handling that is not here yet.
+    double leader_timeout = 5.0;
 
     // Smoothing / control-shaping parameters.
     double smooth_alpha      = 0.35;
@@ -146,7 +170,8 @@ void usage(const char* prog) {
         "\n"
         "Teleop options:\n"
         "  --protocol quic|udp|tcp          (default: quic)\n"
-        "  --teleoperation-time SEC         (default: 20)\n"
+        "  --teleoperation-time SEC         hard session deadline; 0 = none, run until Ctrl-C\n"
+        "                                   (default: 20)\n"
         "  --rate-hz HZ                     (default: 100)\n"
         "  --connect-timeout SEC            (default: 20)\n"
         "  --ready-timeout SEC              (default: 60)\n"
@@ -156,7 +181,12 @@ void usage(const char* prog) {
         "  --right-model NAME               wxai_v0|pro (default: wxai_v0)\n"
         "  --button-gated                   Glide leaders only: start stopped; SEL_1 on each leader\n"
         "                                   starts/stops that side's teleop (stop moves it home),\n"
-        "                                   SEL_2 clears a fault and resumes (independent per side)\n"
+        "                                   SEL_2 clears a fault and resumes (independent per side).\n"
+        "                                   Also required for the SEL_1 resume after a leader-loss\n"
+        "                                   pause; without it a side auto-resumes instead\n"
+        "  --leader-timeout SEC             no leader state for this long -> that side moves home and\n"
+        "                                   pauses; press SEL_1 once the leader is back to resume\n"
+        "                                   (default: 5)\n"
         "\n"
         "Smoothing options:\n"
         "  --smooth-alpha A                 EMA factor in (0,1]; 1.0 disables (default: 0.35)\n"
@@ -187,7 +217,9 @@ void usage(const char* prog) {
         "  --camera-serial-3 SERIAL         serial for camera 3 (default: auto)\n"
         "  --camera-width N                 RealSense only (default: 640)\n"
         "  --camera-height N                RealSense only (default: 480)\n"
-        "  --camera-resolution RES          ZED only: HD2K|HD1200|HD1080|HD720|SVGA|VGA (default: HD1200)\n"
+        "  --camera-resolution RES          ZED only: OUTPUT size, downsampled from the ZED X's native\n"
+        "                                   HD1200 capture; HD2K|HD1200|HD1080|HD720|SVGA|VGA\n"
+        "                                   (default: HD1200, i.e. no downsampling)\n"
         "  --camera-fps N                   (default: 30)\n"
         "  --camera-bitrate-kbps N          (default: 4000)\n",
         prog);
@@ -212,6 +244,7 @@ Options parse(int argc, char** argv) {
         else if (a == "--stall-log-ms")        o.stall_log_ms = ta::parse_double(ta::require_value(a, argc, argv, i), a);
         else if (a == "--clear-error")         o.clear_error = true;
         else if (a == "--button-gated")        o.button_gated = true;
+        else if (a == "--leader-timeout")      o.leader_timeout = ta::parse_double(ta::require_value(a, argc, argv, i), a);
         else if (a == "--smooth-alpha")        o.smooth_alpha = ta::parse_double(ta::require_value(a, argc, argv, i), a);
         else if (a == "--max-step")            o.max_step = ta::parse_double(ta::require_value(a, argc, argv, i), a);
         else if (a == "--initial-sync-time")   o.initial_sync_time = ta::parse_double(ta::require_value(a, argc, argv, i), a);
@@ -252,6 +285,7 @@ Options parse(int argc, char** argv) {
     if (o.initial_sync_time < 0.0) throw std::runtime_error("--initial-sync-time must be >= 0");
     if (o.command_time < 0.0)      throw std::runtime_error("--command-time must be >= 0");
     if (o.stats_interval_s < 0.0)  throw std::runtime_error("--stats-interval must be >= 0");
+    if (o.leader_timeout <= 0.0)   throw std::runtime_error("--leader-timeout must be > 0");
     if (o.camera_enabled) {
 #if defined(ADAMO_TROSSEN_HAS_REALSENSE) && defined(ADAMO_TROSSEN_HAS_ZED)
         if (o.camera_backend != "realsense" && o.camera_backend != "zed") {
@@ -297,6 +331,12 @@ struct ArmSmoothState {
     std::optional<std::chrono::steady_clock::time_point> next_stats;
     std::vector<double> sync_start;          // arm position when the current sync ramp began
     std::optional<std::chrono::steady_clock::time_point> sync_started_at;
+
+    // When this side last heard from its leader. Empty means "nothing heard
+    // yet", which is why a side that is merely waiting to be started is never
+    // mistaken for a leader that went away. Cleared on every deliberate
+    // start/stop so the gap across a stop is not read as a disconnect.
+    std::optional<std::chrono::steady_clock::time_point> last_state_at;
 };
 
 // Process a decoded state sample for one arm, commanding the driver and updating
@@ -311,6 +351,7 @@ bool process_arm_state(const trossen_adamo::wire::State& s,
 
     const double latency_ms = std::max(0.0, (trossen_adamo::wire::now_seconds() - s.timestamp) * 1000.0);
     ss.latencies_ms.push_back(latency_ms);
+    ss.last_state_at = std::chrono::steady_clock::now();
 
     if (!ss.synced) {
         // Non-blocking ramp toward the leader's live pose (re-sampled each
@@ -544,8 +585,13 @@ int main(int argc, char** argv) try {
     right_driver->set_all_modes(trossen_arm::Mode::position);
 
     const double teleop_started_at = ta::wire::now_seconds();
-    const auto loop_end = std::chrono::steady_clock::now() +
-                          std::chrono::duration<double>(opt.teleoperation_time);
+    // Empty with --teleoperation-time 0: the session then ends only on Ctrl-C.
+    std::optional<std::chrono::steady_clock::time_point> loop_end;
+    if (opt.teleoperation_time > 0.0) {
+        loop_end = std::chrono::steady_clock::now() +
+                   std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                       std::chrono::duration<double>(opt.teleoperation_time));
+    }
 
     ArmSmoothState left_ss;
     ArmSmoothState right_ss;
@@ -567,9 +613,18 @@ int main(int argc, char** argv) try {
     // whole run (today's behaviour, unchanged) and each side's fault
     // tracker is bypassed entirely so an uncaught driver exception still
     // propagates as before.
-    enum class TeleopState { Stopped, Active };
+    //
+    // Paused is the leader-loss state: that side's leader stopped publishing,
+    // the arm went home, and it waits there. It differs from Stopped in what it
+    // is waiting for -- Stopped waits for an operator, Paused waits for the
+    // leader script to come back *and then* for the operator.
+    enum class TeleopState { Stopped, Active, Paused };
     TeleopState state_left  = opt.button_gated ? TeleopState::Stopped : TeleopState::Active;
     TeleopState state_right = opt.button_gated ? TeleopState::Stopped : TeleopState::Active;
+    // Whether a paused side has seen its leader publishing again, i.e. whether
+    // pressing SEL_1 would resume anything.
+    bool leader_back_left  = false;
+    bool leader_back_right = false;
     std::vector<std::uint8_t> teleop_toggle_left_buf, teleop_toggle_right_buf;
     std::vector<std::uint8_t> error_recover_left_buf, error_recover_right_buf;
     std::vector<std::uint8_t> leader_fault_left_buf, leader_fault_right_buf;
@@ -588,12 +643,63 @@ int main(int argc, char** argv) try {
         return true;
     };
 
+    // Enter the leader-loss pause for one side: home the arm and wait. The
+    // queued state sample is dropped on the way in so that the first *new*
+    // sample is what proves the leader script is running again -- otherwise a
+    // sample published moments before the leader died would read as "back".
+    const auto pause_side = [&](const char* label,
+                                trossen_arm::TrossenArmDriver& driver,
+                                auto&& guard,
+                                TeleopState& state,
+                                ArmSmoothState& ss,
+                                bool& leader_back,
+                                ta::LatestSubscriber& state_sub,
+                                std::vector<std::uint8_t>& state_buf) {
+        guard([&] { ta::arm::move_home(driver); });
+        state       = TeleopState::Paused;
+        leader_back = false;
+        ss.last_state_at.reset();
+        state_sub.poll(state_buf);
+        std::cout << label << ": leader silent for " << opt.leader_timeout
+                  << "s, moved home and paused; waiting for the leader to come back\n";
+    };
+
+    // Resume a paused or stopped side. `synced` is cleared so the existing sync
+    // ramp carries the arm from home to the leader's live pose over
+    // --initial-sync-time instead of snapping to it.
+    const auto resume_side = [&](const char* label, TeleopState& state, ArmSmoothState& ss) {
+        state = TeleopState::Active;
+        ss.synced = false;
+        ss.sync_started_at.reset();
+        std::cout << label << ": resuming teleop, ramping into the leader pose over "
+                  << opt.initial_sync_time << "s\n";
+    };
+
     if (opt.button_gated) {
         std::cout << "bimanual_follower: --button-gated: waiting for each leader's SEL_1 button to start teleop\n";
     }
+    std::cout << "bimanual_follower: leader-loss pause after " << opt.leader_timeout
+              << "s of silence; the process stays up until Ctrl-C\n";
 
-    while (!ta::stop_requested() && std::chrono::steady_clock::now() < loop_end) {
+    // Ticks between follower_ready republishes: every 5th tick is ~20Hz at the
+    // default --rate-hz, matching the handshake's own cadence. 64-bit because
+    // this process is meant to run for days.
+    std::uint64_t ready_tick = 0;
+
+    while (!ta::stop_requested() &&
+           (!loop_end || std::chrono::steady_clock::now() < *loop_end)) {
         const auto loop_start = std::chrono::steady_clock::now();
+
+        // Keep advertising follower_ready for the whole session, not just during
+        // our own handshake. A leader restarted mid-session runs
+        // wait_for_peer_ready() again and only accepts a ready sample stamped
+        // after *its* start; a follower that went quiet after its own handshake
+        // could never be found again, which looked exactly like "the follower
+        // refuses to reconnect".
+        if (++ready_tick % 5 == 0) {
+            const auto payload = ta::wire::encode_ready(ta::wire::now_seconds());
+            ready_pub.put(payload.data(), payload.size());
+        }
 
         // Publish latest efforts for both arms; guarded only in --button-gated mode.
         maybe_guard_left([&] {
@@ -615,14 +721,25 @@ int main(int argc, char** argv) try {
                     ts >= teleop_started_at) {
                     if (fault_tracker_left.faulted()) {
                         std::cout << "bimanual_follower: ignoring left start/stop — faulted; press the left error-recovery button first\n";
+                    } else if (state_left == TeleopState::Paused) {
+                        if (leader_back_left) {
+                            resume_side("bimanual_follower_left", state_left, left_ss);
+                        } else {
+                            std::cout << "bimanual_follower: ignoring left resume — the left leader is not publishing yet\n";
+                        }
                     } else if (state_left == TeleopState::Stopped) {
                         state_left = TeleopState::Active;
                         left_ss.synced = false;
                         left_ss.sync_started_at.reset();
+                        // Start the liveness clock from the first sample after the
+                        // press, not from whenever this side last ran.
+                        left_ss.last_state_at.reset();
                         std::cout << "bimanual_follower: left teleop started (leader button)\n";
                     } else {
                         maybe_guard_left([&] { ta::arm::move_home(*left_driver); });
                         state_left = TeleopState::Stopped;
+                        left_ss.last_state_at.reset();
+                        leader_back_left = false;
                         std::cout << "bimanual_follower: left teleop stopped (leader button), moved home\n";
                     }
                 }
@@ -638,6 +755,10 @@ int main(int argc, char** argv) try {
                         state_left = TeleopState::Active;
                         left_ss.synced = false;
                         left_ss.sync_started_at.reset();
+                        // No samples were accepted while faulted, so the liveness
+                        // clock is stale: restart it from the next sample.
+                        left_ss.last_state_at.reset();
+                        leader_back_left = false;
                         std::cout << "bimanual_follower: left fault cleared (leader button), resuming teleop\n";
                     }
                 }
@@ -650,14 +771,25 @@ int main(int argc, char** argv) try {
                     ts >= teleop_started_at) {
                     if (fault_tracker_right.faulted()) {
                         std::cout << "bimanual_follower: ignoring right start/stop — faulted; press the right error-recovery button first\n";
+                    } else if (state_right == TeleopState::Paused) {
+                        if (leader_back_right) {
+                            resume_side("bimanual_follower_right", state_right, right_ss);
+                        } else {
+                            std::cout << "bimanual_follower: ignoring right resume — the right leader is not publishing yet\n";
+                        }
                     } else if (state_right == TeleopState::Stopped) {
                         state_right = TeleopState::Active;
                         right_ss.synced = false;
                         right_ss.sync_started_at.reset();
+                        // Start the liveness clock from the first sample after the
+                        // press, not from whenever this side last ran.
+                        right_ss.last_state_at.reset();
                         std::cout << "bimanual_follower: right teleop started (leader button)\n";
                     } else {
                         maybe_guard_right([&] { ta::arm::move_home(*right_driver); });
                         state_right = TeleopState::Stopped;
+                        right_ss.last_state_at.reset();
+                        leader_back_right = false;
                         std::cout << "bimanual_follower: right teleop stopped (leader button), moved home\n";
                     }
                 }
@@ -673,6 +805,10 @@ int main(int argc, char** argv) try {
                         state_right = TeleopState::Active;
                         right_ss.synced = false;
                         right_ss.sync_started_at.reset();
+                        // No samples were accepted while faulted, so the liveness
+                        // clock is stale: restart it from the next sample.
+                        right_ss.last_state_at.reset();
+                        leader_back_right = false;
                         std::cout << "bimanual_follower: right fault cleared (leader button), resuming teleop\n";
                     }
                 }
@@ -688,6 +824,8 @@ int main(int argc, char** argv) try {
                     ts >= teleop_started_at && state_left == TeleopState::Active) {
                     maybe_guard_left([&] { ta::arm::move_home(*left_driver); });
                     state_left = TeleopState::Stopped;
+                    left_ss.last_state_at.reset();
+                    leader_back_left = false;
                     std::cout << "bimanual_follower: left leader faulted, stopped and moved home\n";
                 }
             }
@@ -697,34 +835,102 @@ int main(int argc, char** argv) try {
                     ts >= teleop_started_at && state_right == TeleopState::Active) {
                     maybe_guard_right([&] { ta::arm::move_home(*right_driver); });
                     state_right = TeleopState::Stopped;
+                    right_ss.last_state_at.reset();
+                    leader_back_right = false;
                     std::cout << "bimanual_follower: right leader faulted, stopped and moved home\n";
                 }
             }
         }
 
-        // Process left arm state.
-        if (state_left == TeleopState::Active && state_left_sub.poll(state_left_buf)) {
+        // Process left arm state. Polled while Paused too: there a sample is not
+        // a command but the proof that the leader script is publishing again.
+        if ((state_left == TeleopState::Active || state_left == TeleopState::Paused) &&
+            state_left_sub.poll(state_left_buf)) {
             try {
                 const auto s = ta::wire::decode_state(state_left_buf.data(), state_left_buf.size());
-                maybe_guard_left([&] {
-                    process_arm_state(s, teleop_started_at, *left_driver, opt, left_ss,
-                                      "bimanual_follower_left");
-                });
+                if (state_left == TeleopState::Active) {
+                    maybe_guard_left([&] {
+                        process_arm_state(s, teleop_started_at, *left_driver, opt, left_ss,
+                                          "bimanual_follower_left");
+                    });
+                } else {
+                    left_ss.last_state_at = std::chrono::steady_clock::now();
+                    if (!leader_back_left) {
+                        leader_back_left = true;
+                        std::cout << "bimanual_follower_left: leader is back — press SEL_1 on the "
+                                     "left leader to resume\n";
+                    }
+                }
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "bimanual_follower: bad left state payload: %s\n", e.what());
             }
         }
 
         // Process right arm state.
-        if (state_right == TeleopState::Active && state_right_sub.poll(state_right_buf)) {
+        if ((state_right == TeleopState::Active || state_right == TeleopState::Paused) &&
+            state_right_sub.poll(state_right_buf)) {
             try {
                 const auto s = ta::wire::decode_state(state_right_buf.data(), state_right_buf.size());
-                maybe_guard_right([&] {
-                    process_arm_state(s, teleop_started_at, *right_driver, opt, right_ss,
-                                      "bimanual_follower_right");
-                });
+                if (state_right == TeleopState::Active) {
+                    maybe_guard_right([&] {
+                        process_arm_state(s, teleop_started_at, *right_driver, opt, right_ss,
+                                          "bimanual_follower_right");
+                    });
+                } else {
+                    right_ss.last_state_at = std::chrono::steady_clock::now();
+                    if (!leader_back_right) {
+                        leader_back_right = true;
+                        std::cout << "bimanual_follower_right: leader is back — press SEL_1 on the "
+                                     "right leader to resume\n";
+                    }
+                }
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "bimanual_follower: bad right state payload: %s\n", e.what());
+            }
+        }
+
+        // Leader-liveness watchdog, both sides, every tick. An Active side whose
+        // leader went quiet pauses; a Paused side whose leader goes quiet again
+        // stops inviting a press it could not honour. A faulted side is left
+        // alone -- the fault path owns that arm until SEL_2 clears it.
+        {
+            const auto now = std::chrono::steady_clock::now();
+            const auto silent_for = [&](const ArmSmoothState& ss) {
+                return std::chrono::duration<double>(now - *ss.last_state_at).count();
+            };
+
+            if (!fault_tracker_left.faulted() && left_ss.last_state_at &&
+                silent_for(left_ss) > opt.leader_timeout) {
+                if (state_left == TeleopState::Active) {
+                    pause_side("bimanual_follower_left", *left_driver, maybe_guard_left,
+                               state_left, left_ss, leader_back_left,
+                               state_left_sub, state_left_buf);
+                } else if (state_left == TeleopState::Paused && leader_back_left) {
+                    leader_back_left = false;
+                    std::cout << "bimanual_follower_left: leader went away again, still paused\n";
+                }
+            }
+            if (!fault_tracker_right.faulted() && right_ss.last_state_at &&
+                silent_for(right_ss) > opt.leader_timeout) {
+                if (state_right == TeleopState::Active) {
+                    pause_side("bimanual_follower_right", *right_driver, maybe_guard_right,
+                               state_right, right_ss, leader_back_right,
+                               state_right_sub, state_right_buf);
+                } else if (state_right == TeleopState::Paused && leader_back_right) {
+                    leader_back_right = false;
+                    std::cout << "bimanual_follower_right: leader went away again, still paused\n";
+                }
+            }
+        }
+
+        // Without --button-gated there is no button to press, so a paused side
+        // resumes itself as soon as its leader is publishing again.
+        if (!opt.button_gated) {
+            if (state_left == TeleopState::Paused && leader_back_left) {
+                resume_side("bimanual_follower_left", state_left, left_ss);
+            }
+            if (state_right == TeleopState::Paused && leader_back_right) {
+                resume_side("bimanual_follower_right", state_right, right_ss);
             }
         }
 
@@ -736,15 +942,17 @@ int main(int argc, char** argv) try {
         // the leader can show the error state.
         {
             const double left_status =
-                fault_tracker_left.faulted()      ? ta::recovery::kFollowerStatusFaulted
+                fault_tracker_left.faulted()        ? ta::recovery::kFollowerStatusFaulted
                 : state_left == TeleopState::Active ? ta::recovery::kFollowerStatusActive
-                                                     : ta::recovery::kFollowerStatusStopped;
+                : state_left == TeleopState::Paused ? ta::recovery::kFollowerStatusPaused
+                                                    : ta::recovery::kFollowerStatusStopped;
             const auto left_payload = ta::wire::encode_status(ta::wire::now_seconds(), left_status);
             follower_status_left_latest.put(left_payload.data(), left_payload.size());
 
             const double right_status =
-                fault_tracker_right.faulted()      ? ta::recovery::kFollowerStatusFaulted
-                : state_right == TeleopState::Active ? ta::recovery::kFollowerStatusActive
+                fault_tracker_right.faulted()         ? ta::recovery::kFollowerStatusFaulted
+                : state_right == TeleopState::Active  ? ta::recovery::kFollowerStatusActive
+                : state_right == TeleopState::Paused  ? ta::recovery::kFollowerStatusPaused
                                                       : ta::recovery::kFollowerStatusStopped;
             const auto right_payload = ta::wire::encode_status(ta::wire::now_seconds(), right_status);
             follower_status_right_latest.put(right_payload.data(), right_payload.size());

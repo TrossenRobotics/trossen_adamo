@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -70,11 +71,26 @@ public:
             static_cast<std::uint32_t>(cfg_.bitrate_kbps));
 
         // The Adamo robot run loop is blocking; drive it from a dedicated thread.
-        adamo_thread_ = std::thread([r = std::move(robot)]() mutable {
-            std::fprintf(stderr, "camera: starting Adamo robot run loop\n");
+        //
+        // The captures are deliberate. stop() detaches this thread, so it can
+        // outlive the streamer: capturing `this` (or cfg_) would dangle. The
+        // stop flag is a shared_ptr precisely so the thread can still set it
+        // after the object is gone, and the track name is copied for the same
+        // reason.
+        adamo_thread_ = std::thread([r = std::move(robot),
+                                     stop = local_stop_,
+                                     track = cfg_.track]() mutable {
+            std::fprintf(stderr, "camera: track '%s' starting Adamo robot run loop\n",
+                         track.c_str());
             const int rc = std::move(r).run();
-            std::fprintf(stderr, "camera: Adamo robot run loop exited with %d\n", rc);
-            stop_flag().store(true);
+            // Stop THIS camera only. This used to set the process-wide stop
+            // flag -- the same one Ctrl-C sets -- so one camera's session
+            // dropping shut down arm teleop and every other camera with it,
+            // indistinguishable from an operator interrupt.
+            std::fprintf(stderr,
+                "camera: track '%s' Adamo run loop exited with %d; stopping this camera, "
+                "the rest of the robot keeps running\n", track.c_str(), rc);
+            stop->store(true);
         });
 
         // Give the robot a moment to spin up before frames start flowing.
@@ -87,9 +103,14 @@ public:
 
     void stop() noexcept {
 #ifdef ADAMO_HAS_VIDEO
-        if (!running_.exchange(false)) return;
-        local_stop_.store(true);
-        try { pipe_.stop(); } catch (...) {}
+        // Not an early return on `!was_running`: start() can throw after the
+        // run-loop thread exists, and the caller now catches that and destroys
+        // the streamer. Leaving a joinable std::thread member for the
+        // destructor would call std::terminate. Idempotent, so the usual
+        // stop()-then-destructor path is still fine.
+        const bool was_running = running_.exchange(false);
+        local_stop_->store(true);
+        if (was_running) { try { pipe_.stop(); } catch (...) {} }
         if (capture_thread_.joinable()) capture_thread_.join();
         track_ = adamo::VideoTrack{};
         // Detach the run-loop thread so it doesn't block process exit.
@@ -103,7 +124,7 @@ private:
         std::vector<std::uint8_t> bgra(static_cast<std::size_t>(width) * height * 4);
         std::uint64_t frames = 0;
         auto last_report = std::chrono::steady_clock::now();
-        while (!local_stop_.load() && !stop_requested()) {
+        while (!local_stop_->load() && !stop_requested()) {
             rs2::frameset fs;
             if (!pipe_.poll_for_frames(&fs)) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -115,7 +136,12 @@ private:
             try {
                 track_.send(bgra.data(), bgra.size());
             } catch (const std::exception& e) {
-                std::fprintf(stderr, "camera: send failed: %s\n", e.what());
+                // Terminal for this camera: the loop exits and does not retry.
+                // Named so it is attributable with several cameras running.
+                std::fprintf(stderr,
+                    "camera: track '%s' send failed, this camera is going dark "
+                    "(no retry): %s\n", cfg_.track.c_str(), e.what());
+                local_stop_->store(true);
                 break;
             }
             ++frames;
@@ -144,7 +170,9 @@ private:
     adamo::VideoTrack track_;
     std::thread adamo_thread_;
     std::thread capture_thread_;
-    std::atomic<bool> local_stop_{false};
+    // shared_ptr, not a plain member: the detached Adamo run-loop thread sets
+    // this and may outlive the streamer.
+    std::shared_ptr<std::atomic<bool>> local_stop_ = std::make_shared<std::atomic<bool>>(false);
     std::atomic<bool> running_{false};
 #endif
 
