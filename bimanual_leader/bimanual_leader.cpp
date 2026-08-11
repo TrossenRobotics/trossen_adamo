@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -303,6 +304,12 @@ int main(int argc, char** argv) try {
     // recovery.hpp). Starts on "Stopped" (SEL_1 breathing).
     double left_follower_status  = ta::recovery::kFollowerStatusStopped;
     double right_follower_status = ta::recovery::kFollowerStatusStopped;
+    // Re-assert the LED pattern this often, so any controller-side reset
+    // (notably clear_error()'s reconnect) is corrected within a second at the
+    // default --rate-hz rather than lingering until the next state change.
+    std::uint64_t led_tick = 0;
+    const std::uint64_t kLedRefreshTicks =
+        static_cast<std::uint64_t>(std::max(1.0, opt.rate_hz));
     ta::recovery::LedState left_led_state  = ta::recovery::LedState::Stopped;
     ta::recovery::LedState right_led_state = ta::recovery::LedState::Stopped;
     if (left_is_glide) {
@@ -481,9 +488,17 @@ int main(int argc, char** argv) try {
             }
         }
 
-        // Update each side's button LEDs to match its follower's latest
-        // status (or that side's own fault, which always wins) -- only
-        // when the desired pattern actually changes.
+        // Update each side's button LEDs to match its follower's latest status
+        // (or that side's own fault, which always wins).
+        //
+        // Edge-triggered on the cached pattern, plus a periodic re-assert,
+        // because the cache can silently stop matching the hardware two ways:
+        // a write skipped by a faulted guard used to update the cache anyway,
+        // and clear_error() reconnects the controller, which resets its
+        // InputCommand -- LEDs dark, while the leader still believes it has
+        // already sent that pattern. Both left the buttons blank until the
+        // next state change; now they heal within a second.
+        const bool led_refresh_due = (++led_tick % kLedRefreshTicks) == 0;
         if (left_is_glide) {
             if (follower_status_left_sub.poll(follower_status_left_buf)) {
                 ta::wire::Status st;
@@ -499,9 +514,14 @@ int main(int argc, char** argv) try {
                 : (left_follower_status == ta::recovery::kFollowerStatusActive
                        ? ta::recovery::LedState::Active
                        : ta::recovery::LedState::Stopped);
-            if (desired_left_led != left_led_state) {
-                maybe_guard_left([&] { left_driver->set_input_command(ta::recovery::make_led_command(desired_left_led)); });
-                left_led_state = desired_left_led;
+            // Cache the new pattern only if the write actually happened, and
+            // re-assert it periodically. See led_refresh above.
+            if (desired_left_led != left_led_state || led_refresh_due) {
+                if (maybe_guard_left([&] {
+                        left_driver->set_input_command(ta::recovery::make_led_command(desired_left_led));
+                    })) {
+                    left_led_state = desired_left_led;
+                }
             }
         }
         if (right_is_glide) {
@@ -519,9 +539,12 @@ int main(int argc, char** argv) try {
                 : (right_follower_status == ta::recovery::kFollowerStatusActive
                        ? ta::recovery::LedState::Active
                        : ta::recovery::LedState::Stopped);
-            if (desired_right_led != right_led_state) {
-                maybe_guard_right([&] { right_driver->set_input_command(ta::recovery::make_led_command(desired_right_led)); });
-                right_led_state = desired_right_led;
+            if (desired_right_led != right_led_state || led_refresh_due) {
+                if (maybe_guard_right([&] {
+                        right_driver->set_input_command(ta::recovery::make_led_command(desired_right_led));
+                    })) {
+                    right_led_state = desired_right_led;
+                }
             }
         }
 
