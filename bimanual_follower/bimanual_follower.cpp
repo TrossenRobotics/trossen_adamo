@@ -544,10 +544,23 @@ int main(int argc, char** argv) try {
 #ifdef ADAMO_TROSSEN_HAS_ZED
     std::vector<std::unique_ptr<ta::camera::ZedStreamer>>       zed_streamers;
 #endif
+    const auto stop_streamers = [&] {
+#ifdef ADAMO_TROSSEN_HAS_REALSENSE
+        for (auto& s : rs_streamers)  s->stop();
+#endif
+#ifdef ADAMO_TROSSEN_HAS_ZED
+        for (auto& s : zed_streamers) s->stop();
+#endif
+    };
 
     if (opt.camera_enabled) {
 #ifdef ADAMO_HAS_VIDEO
         bool started = false;
+        // Counted so one dead camera degrades the rig instead of ending it. A
+        // failed open() throws, and letting that escape took the whole process
+        // down - three cameras, both arms - over one unseated GMSL cable.
+        int cameras_started = 0;
+        int cameras_failed  = 0;
 #ifdef ADAMO_TROSSEN_HAS_REALSENSE
         if (!started && opt.camera_backend == "realsense") {
             for (int idx = 0; idx < opt.num_cameras; ++idx) {
@@ -561,9 +574,18 @@ int main(int argc, char** argv) try {
                 c.fps          = opt.camera_fps;
                 c.bitrate_kbps = opt.camera_bitrate_kbps;
                 c.protocol     = protocol;
-                auto streamer = std::make_unique<ta::camera::RealSenseStreamer>(std::move(c));
-                streamer->start();
-                rs_streamers.push_back(std::move(streamer));
+                const std::string track = c.track;   // copied before the move
+                try {
+                    auto streamer = std::make_unique<ta::camera::RealSenseStreamer>(std::move(c));
+                    streamer->start();
+                    rs_streamers.push_back(std::move(streamer));
+                    ++cameras_started;
+                } catch (const std::exception& e) {
+                    ++cameras_failed;
+                    std::fprintf(stderr,
+                        "bimanual_follower: camera '%s' failed to start, continuing without it: %s\n",
+                        track.c_str(), e.what());
+                }
             }
             started = true;
         }
@@ -580,9 +602,18 @@ int main(int argc, char** argv) try {
                 c.fps          = opt.camera_fps;
                 c.bitrate_kbps = opt.camera_bitrate_kbps;
                 c.protocol     = protocol;
-                auto streamer = std::make_unique<ta::camera::ZedStreamer>(std::move(c));
-                streamer->start();
-                zed_streamers.push_back(std::move(streamer));
+                const std::string track = c.track;   // copied before the move
+                try {
+                    auto streamer = std::make_unique<ta::camera::ZedStreamer>(std::move(c));
+                    streamer->start();
+                    zed_streamers.push_back(std::move(streamer));
+                    ++cameras_started;
+                } catch (const std::exception& e) {
+                    ++cameras_failed;
+                    std::fprintf(stderr,
+                        "bimanual_follower: camera '%s' failed to start, continuing without it: %s\n",
+                        track.c_str(), e.what());
+                }
             }
             started = true;
         }
@@ -592,6 +623,17 @@ int main(int argc, char** argv) try {
                 "bimanual_follower: --camera-backend '%s' is not supported by this build\n",
                 opt.camera_backend.c_str());
             return 1;
+        }
+        if (cameras_failed > 0) {
+            std::fprintf(stderr,
+                "bimanual_follower: %d of %d cameras failed to start, %d streaming\n",
+                cameras_failed, opt.num_cameras, cameras_started);
+        }
+        if (cameras_started == 0) {
+            // Arms are the point of a teleop session; losing the video is bad
+            // but not a reason to refuse to drive.
+            std::fprintf(stderr,
+                "bimanual_follower: no cameras started, continuing with arms only\n");
         }
 #else
         std::fprintf(stderr,
@@ -1037,12 +1079,7 @@ int main(int argc, char** argv) try {
     effort_right_latest.close();
 
     std::cout << "bimanual_follower: returning home + sleep\n";
-#ifdef ADAMO_TROSSEN_HAS_REALSENSE
-    for (auto& s : rs_streamers)  s->stop();
-#endif
-#ifdef ADAMO_TROSSEN_HAS_ZED
-    for (auto& s : zed_streamers) s->stop();
-#endif
+    stop_streamers();
     // Park guards run here as we return: position mode, home, sleep.
     return 0;
 } catch (const std::exception& e) {
