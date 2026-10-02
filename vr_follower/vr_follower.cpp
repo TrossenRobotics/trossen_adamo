@@ -4,7 +4,8 @@
 // to VR frames from vr_headset via Adamo pubsub, and mirrors VR controller
 // movements to robot arm end-effector. Grip/hand trigger controls engagement
 // (auto-engage when held, auto-disengage when released), button B exits,
-// right index trigger controls gripper.
+// right index trigger controls gripper. Optionally streams the host's
+// RealSense camera through the Adamo C SDK.
 
 #include "adamo/adamo.hpp"
 #include "trossen_vr/trossen_vr.hpp"
@@ -19,6 +20,8 @@
 #include "trossen_adamo/topics.hpp"
 #include "trossen_adamo/wire_vr.hpp"
 
+#include "realsense_streamer.hpp"
+
 #include <array>
 #include <chrono>
 #include <cstdio>
@@ -26,6 +29,7 @@
 #include <cstdint>
 #include <exception>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -39,6 +43,7 @@ namespace {
 // Built-in defaults. Override order: CLI flag > environment variable > default.
 constexpr const char* kDefaultRobot      = "vr_teleop";
 constexpr const char* kDefaultFollowerIp = "192.168.1.3";
+constexpr int         kMaxCameras        = 2;
 
 struct Options {
     std::string api_key;
@@ -51,6 +56,16 @@ struct Options {
     double rate_hz = 100.0;
     double stall_log_ms = 50.0;
     bool clear_error = false;
+
+    bool        camera_enabled = true;
+    int         num_cameras = 1;
+    // Per-camera track names and serial numbers (indices 0..num_cameras-1).
+    std::array<std::string, kMaxCameras> camera_tracks  = {"main", "wrist"};
+    std::array<std::string, kMaxCameras> camera_serials = {"", ""};
+    int         camera_width = 640;
+    int         camera_height = 480;
+    int         camera_fps = 30;
+    int         camera_bitrate_kbps = 4000;
 };
 
 void usage(const char* prog) {
@@ -71,7 +86,19 @@ void usage(const char* prog) {
         "  --connect-timeout SEC       (default: 20)\n"
         "  --ready-timeout SEC         (default: 60)\n"
         "  --stall-log-ms MS           (default: 50)\n"
-        "  --clear-error               clear arm fault on connect\n",
+        "  --clear-error               clear arm fault on connect\n"
+        "\n"
+        "Camera options (RealSense color):\n"
+        "  --no-camera                 disable all camera streamers\n"
+        "  --num-cameras N             1-2 (default: 1)\n"
+        "  --camera-track-0 NAME       track name for camera 0 (default: main)\n"
+        "  --camera-track-1 NAME       track name for camera 1 (default: wrist)\n"
+        "  --camera-serial-0 SERIAL    serial for camera 0 (default: auto)\n"
+        "  --camera-serial-1 SERIAL    serial for camera 1 (required when --num-cameras 2)\n"
+        "  --camera-width N            (default: 640)\n"
+        "  --camera-height N           (default: 480)\n"
+        "  --camera-fps N              (default: 30)\n"
+        "  --camera-bitrate-kbps N     (default: 4000)\n",
     prog);
 }
 
@@ -90,6 +117,16 @@ Options parse(int argc, char** argv) {
         else if (a == "--ready-timeout")       o.ready_timeout = ta::parse_double(ta::require_value(a, argc, argv, i), a);
         else if (a == "--stall-log-ms")        o.stall_log_ms = ta::parse_double(ta::require_value(a, argc, argv, i), a);
         else if (a == "--clear-error")         o.clear_error = true;
+        else if (a == "--no-camera")           o.camera_enabled = false;
+        else if (a == "--num-cameras")         o.num_cameras = ta::parse_int(ta::require_value(a, argc, argv, i), a);
+        else if (a == "--camera-track-0")      o.camera_tracks[0] = ta::require_value(a, argc, argv, i);
+        else if (a == "--camera-track-1")      o.camera_tracks[1] = ta::require_value(a, argc, argv, i);
+        else if (a == "--camera-serial-0")     o.camera_serials[0] = ta::require_value(a, argc, argv, i);
+        else if (a == "--camera-serial-1")     o.camera_serials[1] = ta::require_value(a, argc, argv, i);
+        else if (a == "--camera-width")        o.camera_width = ta::parse_int(ta::require_value(a, argc, argv, i), a);
+        else if (a == "--camera-height")       o.camera_height = ta::parse_int(ta::require_value(a, argc, argv, i), a);
+        else if (a == "--camera-fps")          o.camera_fps = ta::parse_int(ta::require_value(a, argc, argv, i), a);
+        else if (a == "--camera-bitrate-kbps") o.camera_bitrate_kbps = ta::parse_int(ta::require_value(a, argc, argv, i), a);
         else if (a == "--help" || a == "-h")   { usage(argv[0]); std::exit(0); }
         else throw std::runtime_error("unknown option: " + a);
     }
@@ -97,6 +134,24 @@ Options parse(int argc, char** argv) {
     o.robot       = ta::cli_env_or_default(o.robot,       "ADAMO_ROBOT_NAME",          kDefaultRobot);
     o.follower_ip = ta::cli_env_or_default(o.follower_ip, "ADAMO_TROSSEN_FOLLOWER_IP", kDefaultFollowerIp);
     if (o.rate_hz <= 0.0) throw std::runtime_error("--rate-hz must be positive");
+    if (o.camera_enabled) {
+        if (o.num_cameras < 1 || o.num_cameras > kMaxCameras) {
+            throw std::runtime_error("--num-cameras must be 1-" + std::to_string(kMaxCameras));
+        }
+        if (o.camera_width <= 0 || o.camera_height <= 0 || o.camera_fps <= 0 || o.camera_bitrate_kbps <= 0) {
+            throw std::runtime_error("camera width/height/fps/bitrate must be positive");
+        }
+        // With several cameras, "first available" would hand the same device
+        // to every streamer, so each one must be pinned by serial.
+        if (o.num_cameras > 1) {
+            for (int idx = 0; idx < o.num_cameras; ++idx) {
+                if (o.camera_serials[static_cast<std::size_t>(idx)].empty()) {
+                    throw std::runtime_error("--camera-serial-" + std::to_string(idx) +
+                                             " is required when --num-cameras > 1");
+                }
+            }
+        }
+    }
     return o;
 }
 
@@ -122,6 +177,35 @@ int main(int argc, char** argv) try {
     // Park guard ensures arm returns to home + sleep on all exit paths.
     // Declared before session so camera/network stops before arm parking.
     ta::arm::ArmParkGuard park_guard(*driver, "follower");
+
+    // Bring up the camera streamers first so the operator's video link is up
+    // by the time teleop begins. Each camera runs its own streamer with a
+    // distinct track name.
+    std::vector<std::unique_ptr<ta::camera::RealSenseStreamer>> streamers;
+    if (opt.camera_enabled) {
+#ifdef ADAMO_HAS_VIDEO
+        for (int idx = 0; idx < opt.num_cameras; ++idx) {
+            ta::camera::Config c;
+            c.api_key      = opt.api_key;
+            c.robot        = opt.robot;
+            c.track        = opt.camera_tracks[static_cast<std::size_t>(idx)];
+            c.serial       = opt.camera_serials[static_cast<std::size_t>(idx)];
+            c.width        = opt.camera_width;
+            c.height       = opt.camera_height;
+            c.fps          = opt.camera_fps;
+            c.bitrate_kbps = opt.camera_bitrate_kbps;
+            c.protocol     = protocol;
+            auto streamer = std::make_unique<ta::camera::RealSenseStreamer>(std::move(c));
+            streamer->start();
+            streamers.push_back(std::move(streamer));
+        }
+#else
+        std::fprintf(stderr,
+            "vr_follower: camera requested but Adamo was built without ADAMO_BUILD_VIDEO; "
+            "rebuild with -DADAMO_BUILD_VIDEO=ON or pass --no-camera\n");
+        return 1;
+#endif
+    }
 
     std::cout << "vr_follower: opening Adamo session (" << opt.protocol_str << ")\n";
     auto session = adamo::Session::open(opt.api_key, protocol);
@@ -236,6 +320,7 @@ int main(int argc, char** argv) try {
     }
 
     std::cout << "vr_follower: returning home + sleep\n";
+    for (auto& streamer : streamers) streamer->stop();
     // park_guard runs here as we return: position mode, home, sleep.
     return 0;
 
