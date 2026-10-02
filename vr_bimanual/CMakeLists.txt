@@ -5,6 +5,7 @@ add_executable(vr_bimanual
 target_link_libraries(vr_bimanual
     PRIVATE
         trossen_adamo_common
+        trossen_vr::trossen_vr_lib
 )
 
 include(GNUInstallDirs)
