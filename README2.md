@@ -87,3 +87,8 @@ trigger opens and closes the gripper. Press B (right) or Y (left) to exit.
 
 - `Unable to connect to ... zenoh.adamohq.com:443. Timeout!` usually means an
   outdated Adamo SDK. Reinstall the latest and make sure only one copy is installed.
+- `Failed to load libcuda.so` on a computer without an NVIDIA GPU: use the CPU encoder.
+  ```sh
+  sudo apt install -y gstreamer1.0-plugins-ugly gstreamer1.0-plugins-bad
+  export ADAMO_VIDEO_BACKEND=gstreamer ADAMO_VIDEO_ENCODER=x264enc
+  ```
